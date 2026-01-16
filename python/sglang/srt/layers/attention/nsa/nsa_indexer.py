@@ -930,9 +930,36 @@ class Indexer(MultiPlatformOp):
             if forward_batch.seq_lens_cpu is not None:
                 max_kv_len = forward_batch.seq_lens_cpu.max().item()
                 skip_logits_computation = max_kv_len <= self.index_topk
+                # 辅助函数：收集 topk indices
 
+        def _maybe_collect_topk(topk_result):
+            from sglang.srt.layers.attention.nsa.topk_locality_collector import (
+                get_collector,
+            )
+            # print(f"[DEBUG] _maybe_collect_topk called")  # DEBUG
+            collector = get_collector()
+            if collector.enabled and topk_result is not None:
+                # print(f"[DEBUG] collecting topk_result")  # DEBUG
+                req_id = str(id(forward_batch))
+                seq_lens = (
+                    forward_batch.seq_lens_cpu.tolist()
+                    if forward_batch.seq_lens_cpu is not None
+                    else []
+                )
+                collector.record(
+                    request_id=req_id,
+                    layer_id=layer_id,
+                    topk_indices=topk_result,
+                    seq_lens=seq_lens,
+                    forward_mode=str(forward_batch.forward_mode),
+                )
+            return topk_result
+
+
+        
         # Optimization: fast path when skipping topk computation
         if skip_logits_computation and (not self.nsa_enable_prefill_cp):
+            # print("[DEBUG] skip_logits_computation fast path")  # DEBUG
             return self._forward_cuda_k_only(
                 x,
                 positions,
@@ -1081,7 +1108,8 @@ class Indexer(MultiPlatformOp):
                         kv_len_next,
                         actual_seq_q_next,
                     )
-                    return torch.cat([topk_result_prev, topk_result_next], dim=0)
+                    topk_result = torch.cat([topk_result_prev, topk_result_next], dim=0)
+                    return _maybe_collect_topk(topk_result)
                 else:
                     topk_result = self._get_topk_ragged(
                         forward_batch, layer_id, q_fp8, weights, metadata
@@ -1094,7 +1122,7 @@ class Indexer(MultiPlatformOp):
                 topk=self.index_topk,
                 layer_id=layer_id,
             )
-        return topk_result
+        return _maybe_collect_topk(topk_result)
 
     def forward_npu(
         self,
