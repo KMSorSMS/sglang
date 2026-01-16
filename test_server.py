@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """SGLang Server 测试脚本"""
 
+import os
+
+# 禁用代理，避免本地请求走代理
+os.environ.pop("http_proxy", None)
+os.environ.pop("https_proxy", None)
+os.environ.pop("HTTP_PROXY", None)
+os.environ.pop("HTTPS_PROXY", None)
+
 import argparse
 import json
 import requests

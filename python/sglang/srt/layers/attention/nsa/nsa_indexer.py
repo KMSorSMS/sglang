@@ -936,7 +936,8 @@ class Indexer(MultiPlatformOp):
             from sglang.srt.layers.attention.nsa.topk_locality_collector import (
                 get_collector,
             )
-            # print(f"[DEBUG] _maybe_collect_topk called")  # DEBUG
+            if not torch.cuda.is_current_stream_capturing():
+                print(f"[DEBUG] _maybe_collect_topk called, topk_result is None: {topk_result is None}")
             collector = get_collector()
             if collector.enabled and topk_result is not None:
                 # print(f"[DEBUG] collecting topk_result")  # DEBUG
@@ -951,7 +952,7 @@ class Indexer(MultiPlatformOp):
                     layer_id=layer_id,
                     topk_indices=topk_result,
                     seq_lens=seq_lens,
-                    forward_mode=str(forward_batch.forward_mode),
+                    forward_mode=forward_batch.forward_mode,
                 )
             return topk_result
 
@@ -959,7 +960,8 @@ class Indexer(MultiPlatformOp):
         
         # Optimization: fast path when skipping topk computation
         if skip_logits_computation and (not self.nsa_enable_prefill_cp):
-            # print("[DEBUG] skip_logits_computation fast path")  # DEBUG
+            if not torch.cuda.is_current_stream_capturing():
+                print(f"[DEBUG] skip_logits_computation fast path: max_kv_len={forward_batch.seq_lens_cpu.max().item() if forward_batch.seq_lens_cpu is not None else 'N/A'}, index_topk={self.index_topk}")
             return self._forward_cuda_k_only(
                 x,
                 positions,

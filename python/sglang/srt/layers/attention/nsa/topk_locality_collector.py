@@ -21,7 +21,10 @@ import os
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 import torch
 
@@ -93,14 +96,21 @@ class TopKLocalityCollector:
         layer_id: int,
         topk_indices: torch.Tensor,
         seq_lens: Optional[List[int]] = None,
-        forward_mode: str = "",
+        forward_mode: Optional["ForwardMode"] = None,
     ):
         """记录一次 topk 选择结果，保存原始索引数据"""
-        if not self.enabled:
-            return
-
         # 在 CUDA graph capture 期间不能执行 .cpu() 操作，跳过记录
         if torch.cuda.is_current_stream_capturing():
+            return
+
+        # 获取 forward_mode 的可读名称
+        mode_name = forward_mode.name if forward_mode is not None else "unknown"
+
+        # DEBUG: 打印调用信息
+        print(f"[TopKCollector DEBUG] record() called: layer={layer_id}, mode={mode_name}, seq_lens={seq_lens}, total_records={self.total_records}, enabled={self.enabled}")
+
+        if not self.enabled:
+            print(f"[TopKCollector DEBUG] skipped: not enabled")
             return
 
         if self.total_records >= self.max_records:
@@ -116,7 +126,7 @@ class TopKLocalityCollector:
         indices_cpu = topk_indices.detach().cpu().clone()
 
         # 判断是否是 decode 模式
-        is_decode = "decode" in forward_mode.lower()
+        is_decode = forward_mode is not None and forward_mode.is_decode()
         step = -1
         if is_decode:
             step = self.decode_steps[request_id]
@@ -128,7 +138,7 @@ class TopKLocalityCollector:
                 "layers": {},
                 "metadata": {
                     "first_seen": timestamp,
-                    "forward_mode": forward_mode,
+                    "forward_mode": mode_name,
                 }
             }
 
@@ -149,7 +159,7 @@ class TopKLocalityCollector:
             "step": step,
             "topk_indices": indices_cpu,
             "seq_lens": seq_lens or [],
-            "forward_mode": forward_mode,
+            "forward_mode": mode_name,
             "timestamp": timestamp,
         })
 
@@ -281,7 +291,7 @@ def record_topk(
     layer_id: int,
     topk_indices: torch.Tensor,
     seq_lens: Optional[List[int]] = None,
-    forward_mode: str = "",
+    forward_mode: Optional["ForwardMode"] = None,
 ):
     """便捷函数：记录 topk 选择结果"""
     get_collector().record(
