@@ -940,18 +940,17 @@ class Indexer(MultiPlatformOp):
                 print(f"[DEBUG] _maybe_collect_topk called, topk_result is None: {topk_result is None}")
             collector = get_collector()
             if collector.enabled and topk_result is not None:
-                # print(f"[DEBUG] collecting topk_result")  # DEBUG
-                req_id = str(id(forward_batch))
-                seq_lens = (
-                    forward_batch.seq_lens_cpu.tolist()
+                # 获取序列长度（单 batch 模式，取最大值）
+                seq_len = (
+                    forward_batch.seq_lens_cpu.max().item()
                     if forward_batch.seq_lens_cpu is not None
-                    else []
+                    else 0
                 )
                 collector.record(
-                    request_id=req_id,
                     layer_id=layer_id,
                     topk_indices=topk_result,
-                    seq_lens=seq_lens,
+                    positions=positions,  # 每个 query token 的位置
+                    seq_len=seq_len,
                     forward_mode=forward_batch.forward_mode,
                 )
             return topk_result

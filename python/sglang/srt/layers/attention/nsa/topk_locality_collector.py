@@ -10,7 +10,7 @@ TopK Indices Collector for NSA (Native Sparse Attention)
 4. 数据自动保存为 .pt 文件，包含原始索引数据
 
 数据格式:
-- 按 request -> layer -> token 组织
+- 按时间顺序记录每次 topk 选择
 - 保留完整的 topk_indices tensor
 - 可直接用于 matplotlib/seaborn 绘图
 """
@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import os
 import time
-from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional
 
@@ -31,33 +30,35 @@ import torch
 
 class TopKLocalityCollector:
     """
-    收集 topk indices 原始数据
+    收集 topk indices 原始数据（简化版，单 batch 模式）
 
     保存的数据结构:
     {
-        "requests": {
-            request_id: {
-                "layers": {
-                    layer_id: {
-                        "topk_indices": Tensor (num_tokens, topk),
-                        "seq_lens": List[int],
-                        "forward_mode": str,
-                        "timestamp": float,
-                    }
-                },
-                "metadata": {...}
-            }
-        },
-        "raw_records": [  # 按时间顺序的原始记录，方便时序分析
+        "records": [  # 按时间顺序的记录（每层每次 forward 一条）
             {
-                "request_id": str,
-                "layer_id": int,
-                "step": int,  # decode step 序号
-                "topk_indices": Tensor,
-                ...
+                "layer_id": int,                        # 层编号
+                "topk_indices": Tensor (num_tokens, topk),  # 选中的 KV block 索引
+                "positions": Tensor (num_tokens,),      # 每个 query token 的位置
+                "num_tokens": int,                      # 本次处理的 token 数
+                "topk": int,                            # top-k 值
+                "seq_len": int,                         # KV cache 总长度
+                "forward_mode": str,                    # "EXTEND" (prefill) 或 "DECODE"
+                "timestamp": float,
             }
-        ]
+        ],
+        "metadata": {
+            "total_records": int,
+            "start_time": float,
+            "save_time": float,
+            "duration": float,
+        }
     }
+
+    数据解读:
+    - topk_indices[i] 是 positions[i] 位置的 query token 选择的 KV block 索引
+    - Prefill: positions = [0, 1, ..., prompt_len-1], 一次处理所有 prompt tokens
+    - Decode: positions = [current_pos], 每次处理一个新 token
+    - seq_len 是 KV cache 总长度，即 query 可以 attend 到的范围
     """
 
     _instance: Optional["TopKLocalityCollector"] = None
@@ -67,22 +68,33 @@ class TopKLocalityCollector:
         self.save_path = Path(os.getenv("NSA_TOPK_SAVE_PATH", "./topk_locality_data"))
         self.max_records = int(os.getenv("NSA_MAX_RECORDS", "10000"))
         self.save_interval = int(os.getenv("NSA_SAVE_INTERVAL", "500"))
+        self.log_to_file = os.getenv("NSA_LOG_TO_FILE", "1") == "1"  # 是否输出可读日志
         print(f"[TopKCollector] Initializing TopKLocalityCollector...")
 
-        # 数据存储 - 保存原始 tensor
-        self.requests: Dict[str, Dict] = {}  # request_id -> layer data
-        self.raw_records: List[Dict] = []  # 按时间顺序的所有记录
-        self.decode_steps: Dict[str, int] = defaultdict(int)  # request_id -> step counter
+        # 数据存储
+        self.records: List[Dict] = []
 
         # 统计
         self.total_records = 0
         self.start_time = time.time()
         self.file_counter = 0
 
+        # 可读日志文件
+        self.log_file = None
         if self.enabled:
             self.save_path.mkdir(parents=True, exist_ok=True)
             print(f"[TopKCollector] Enabled, saving to {self.save_path}")
             print(f"[TopKCollector] Max records: {self.max_records}, save interval: {self.save_interval}")
+            if self.log_to_file:
+                log_path = self.save_path / "topk_readable.log"
+                self.log_file = open(log_path, "a")  # 追加模式
+                # 写入分隔符，区分不同运行
+                from datetime import datetime
+                self.log_file.write(f"\n{'='*60}\n")
+                self.log_file.write(f"New session: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                self.log_file.write(f"{'='*60}\n")
+                self.log_file.flush()
+                print(f"[TopKCollector] Readable log (append): {log_path}")
 
     @classmethod
     def get_instance(cls) -> "TopKLocalityCollector":
@@ -92,13 +104,22 @@ class TopKLocalityCollector:
 
     def record(
         self,
-        request_id: str,
         layer_id: int,
         topk_indices: torch.Tensor,
-        seq_lens: Optional[List[int]] = None,
+        positions: torch.Tensor,
+        seq_len: int = 0,
         forward_mode: Optional["ForwardMode"] = None,
     ):
-        """记录一次 topk 选择结果，保存原始索引数据"""
+        """记录一次 topk 选择结果
+
+        Args:
+            layer_id: 层编号
+            topk_indices: 选中的 KV block 索引，形状 (num_tokens, topk)
+            positions: 每个 query token 的位置，形状 (num_tokens,)
+                       topk_indices[i] 对应 positions[i] 这个位置的 query
+            seq_len: KV cache 总长度（query 可以 attend 到的范围）
+            forward_mode: EXTEND (prefill) 或 DECODE
+        """
         # 在 CUDA graph capture 期间不能执行 .cpu() 操作，跳过记录
         if torch.cuda.is_current_stream_capturing():
             return
@@ -107,10 +128,9 @@ class TopKLocalityCollector:
         mode_name = forward_mode.name if forward_mode is not None else "unknown"
 
         # DEBUG: 打印调用信息
-        print(f"[TopKCollector DEBUG] record() called: layer={layer_id}, mode={mode_name}, seq_lens={seq_lens}, total_records={self.total_records}, enabled={self.enabled}")
+        print(f"[TopKCollector DEBUG] record(): layer={layer_id}, mode={mode_name}, seq_len={seq_len}, num_tokens={positions.shape[0]}, total={self.total_records}")
 
         if not self.enabled:
-            print(f"[TopKCollector DEBUG] skipped: not enabled")
             return
 
         if self.total_records >= self.max_records:
@@ -124,44 +144,23 @@ class TopKLocalityCollector:
 
         # 保存原始 tensor (clone 到 CPU)
         indices_cpu = topk_indices.detach().cpu().clone()
+        positions_cpu = positions.detach().cpu().clone()
 
-        # 判断是否是 decode 模式
-        is_decode = forward_mode is not None and forward_mode.is_decode()
-        step = -1
-        if is_decode:
-            step = self.decode_steps[request_id]
-            self.decode_steps[request_id] += 1
-
-        # 按 request/layer 组织的数据
-        if request_id not in self.requests:
-            self.requests[request_id] = {
-                "layers": {},
-                "metadata": {
-                    "first_seen": timestamp,
-                    "forward_mode": mode_name,
-                }
-            }
-
-        # 保存到 layer 字典 (会覆盖同一 layer 的旧数据，只保留最新)
-        self.requests[request_id]["layers"][layer_id] = {
-            "topk_indices": indices_cpu,
-            "seq_lens": seq_lens or [],
+        # 保存记录
+        self.records.append({
+            "layer_id": layer_id,
+            "topk_indices": indices_cpu,           # (num_tokens, topk)
+            "positions": positions_cpu,             # (num_tokens,) query 位置
             "num_tokens": indices_cpu.shape[0],
             "topk": indices_cpu.shape[1] if len(indices_cpu.shape) > 1 else 0,
-            "timestamp": timestamp,
-            "step": step,
-        }
-
-        # 同时保存到原始记录列表 (保留所有历史，用于时序分析)
-        self.raw_records.append({
-            "request_id": request_id,
-            "layer_id": layer_id,
-            "step": step,
-            "topk_indices": indices_cpu,
-            "seq_lens": seq_lens or [],
+            "seq_len": seq_len,                     # KV cache 总长度
             "forward_mode": mode_name,
             "timestamp": timestamp,
         })
+
+        # 写入可读日志
+        if self.log_file is not None:
+            self._write_readable_log(layer_id, indices_cpu, positions_cpu, seq_len, mode_name)
 
         self.total_records += 1
 
@@ -170,9 +169,34 @@ class TopKLocalityCollector:
             print(f"[TopKCollector] Auto-saving at {self.total_records} records...")
             self.save()
 
+    def _write_readable_log(
+        self,
+        layer_id: int,
+        indices: torch.Tensor,
+        positions: torch.Tensor,
+        seq_len: int,
+        mode_name: str,
+    ):
+        """写入人类可读的日志"""
+        num_tokens = indices.shape[0]
+        topk = indices.shape[1] if len(indices.shape) > 1 else 0
+
+        # 写入头部信息（每个 forward 一行）
+        self.log_file.write(f"\n[Layer {layer_id}] {mode_name} | seq_len={seq_len} | tokens={num_tokens}\n")
+
+        # 每个 token 一行：pos -> top10 indices
+        for i in range(num_tokens):
+            pos = positions[i].item()
+            # 取前 10 个 indices（如果不足 10 个就全部显示）
+            top_indices = indices[i][:min(10, topk)].tolist()
+            indices_str = ", ".join(map(str, top_indices))
+            self.log_file.write(f"  pos={pos:4d} -> [{indices_str}]\n")
+
+        self.log_file.flush()  # 立即刷新，方便实时查看
+
     def save(self, filename: Optional[str] = None):
         """保存收集的原始数据（单文件追加模式）"""
-        if not self.enabled or len(self.raw_records) == 0:
+        if not self.enabled or len(self.records) == 0:
             return
 
         if filename is None:
@@ -181,37 +205,32 @@ class TopKLocalityCollector:
         save_file = self.save_path / filename
 
         self.file_counter += 1
-        appended_count = len(self.raw_records)
+        appended_count = len(self.records)
 
         # 如果文件已存在，加载并合并
         if save_file.exists():
             existing = torch.load(save_file, weights_only=False)
-            existing["requests"].update(self.requests)
-            existing["raw_records"].extend(self.raw_records)
-            existing["metadata"]["total_records"] = len(existing["raw_records"])
-            existing["metadata"]["num_requests"] = len(existing["requests"])
+            existing["records"].extend(self.records)
+            existing["metadata"]["total_records"] = len(existing["records"])
             existing["metadata"]["save_time"] = time.time()
             existing["metadata"]["duration"] = time.time() - existing["metadata"]["start_time"]
             data = existing
-            print(f"[TopKCollector] Appended {appended_count} records, total: {len(existing['raw_records'])}")
+            print(f"[TopKCollector] Appended {appended_count} records, total: {len(existing['records'])}")
         else:
             data = {
-                "requests": self.requests,
-                "raw_records": self.raw_records,
+                "records": self.records,
                 "metadata": {
-                    "total_records": len(self.raw_records),
-                    "num_requests": len(self.requests),
+                    "total_records": len(self.records),
                     "start_time": self.start_time,
                     "save_time": time.time(),
                     "duration": time.time() - self.start_time,
                 }
             }
-            appended_count = 0  # 首次保存，不是追加
-            print(f"[TopKCollector] Saved {len(self.raw_records)} records to {save_file}")
+            print(f"[TopKCollector] Saved {len(self.records)} records to {save_file}")
 
         torch.save(data, save_file)
 
-        # 保存一份轻量级的索引信息 (用于快速预览)
+        # 保存一份轻量级的索引信息
         self._save_index_file(save_file, data, appended_count)
 
         # 清空内存中的数据
@@ -221,12 +240,23 @@ class TopKLocalityCollector:
         """保存索引文件，记录每次保存的历史"""
         index_file = main_file.with_suffix(".index.txt")
 
-        requests = data["requests"]
-        raw_records = data["raw_records"]
+        records = data["records"]
         metadata = data["metadata"]
 
         from datetime import datetime
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # 统计每层的记录数
+        layer_counts = {}
+        for record in records:
+            layer_id = record["layer_id"]
+            layer_counts[layer_id] = layer_counts.get(layer_id, 0) + 1
+
+        # 统计 forward_mode
+        mode_counts = {}
+        for record in records:
+            mode = record["forward_mode"]
+            mode_counts[mode] = mode_counts.get(mode, 0) + 1
 
         # 构建本次保存的记录
         lines = [
@@ -235,69 +265,42 @@ class TopKLocalityCollector:
             f"Save #{self.file_counter} ({timestamp})",
             f"{'=' * 50}",
             f"Main file: {main_file.name}",
-            f"Total records: {len(raw_records)}" + (f" (appended {appended_count})" if appended_count > 0 else ""),
-            f"Num requests: {len(requests)}",
+            f"Total records: {len(records)}" + (f" (appended {appended_count})" if appended_count > 0 else ""),
             f"Duration: {metadata['duration']:.2f}s",
             f"",
-            f"Requests:",
+            f"Per-layer counts:",
         ]
 
-        for req_id, req_data in requests.items():
-            layers = sorted(req_data["layers"].keys())
-            num_layers = len(layers)
-            sample_layer = req_data["layers"][layers[0]] if layers else {}
-            num_tokens = sample_layer.get("num_tokens", 0)
-            topk = sample_layer.get("topk", 0)
+        for layer_id in sorted(layer_counts.keys()):
+            lines.append(f"  Layer {layer_id}: {layer_counts[layer_id]} records")
 
-            lines.append(f"  {req_id}: {num_layers} layers, {num_tokens} tokens, topk={topk}")
+        lines.append(f"")
+        lines.append(f"Per-mode counts:")
+        for mode, count in sorted(mode_counts.items()):
+            lines.append(f"  {mode}: {count} records")
 
         # 追加到文件
         with open(index_file, "a") as f:
             f.write("\n".join(lines) + "\n")
 
-    def get_layer_indices(self, request_id: str, layer_id: int) -> Optional[torch.Tensor]:
-        """获取指定 request 和 layer 的 topk indices"""
-        if request_id in self.requests:
-            layers = self.requests[request_id]["layers"]
-            if layer_id in layers:
-                return layers[layer_id]["topk_indices"]
-        return None
-
-    def get_all_layers_indices(self, request_id: str) -> Dict[int, torch.Tensor]:
-        """获取指定 request 所有层的 topk indices"""
-        if request_id not in self.requests:
-            return {}
-        return {
-            layer_id: data["topk_indices"]
-            for layer_id, data in self.requests[request_id]["layers"].items()
-        }
-
     def clear(self, reset_counter: bool = False):
-        """清空内存中的数据（不重置 total_records 计数器，除非显式指定）"""
-        self.requests.clear()
-        self.raw_records.clear()
-        self.decode_steps.clear()
+        """清空内存中的数据"""
+        self.records.clear()
         if reset_counter:
             self.total_records = 0
+
+    def close(self):
+        """关闭日志文件"""
+        if self.log_file is not None:
+            self.log_file.close()
+            self.log_file = None
+            print(f"[TopKCollector] Log file closed")
+
+    def __del__(self):
+        """析构时关闭文件"""
+        self.close()
 
 
 # 全局访问函数
 def get_collector() -> TopKLocalityCollector:
     return TopKLocalityCollector.get_instance()
-
-
-def record_topk(
-    request_id: str,
-    layer_id: int,
-    topk_indices: torch.Tensor,
-    seq_lens: Optional[List[int]] = None,
-    forward_mode: Optional["ForwardMode"] = None,
-):
-    """便捷函数：记录 topk 选择结果"""
-    get_collector().record(
-        request_id=request_id,
-        layer_id=layer_id,
-        topk_indices=topk_indices,
-        seq_lens=seq_lens,
-        forward_mode=forward_mode,
-    )

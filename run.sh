@@ -3,12 +3,12 @@
 # 模型路径: /mnt/shared/models/DeepSeek-V3.2
 
 MODEL_PATH="/mnt/shared/models/DeepSeek-V3.2"
-PORT=30000
+PORT="${PORT:-30000}"  # 可通过环境变量覆盖，如: PORT=31000 ./run.sh
 HOST="0.0.0.0"
 
 # 层数设置 (设置为空或0表示使用全部层)
 # DeepSeek V3.2 原模型共61层
-NUM_LAYERS="5"
+NUM_LAYERS="10"
 
 # CUDA Graph 设置 (设置为1禁用，用于收集 decode 阶段数据)
 # 注意: 禁用 CUDA graph 会降低性能，仅在需要调试/收集数据时使用
@@ -29,6 +29,8 @@ SKIP_DEEPGEMM_PRECOMPILE="1"
 # 构建额外参数
 build_extra_args() {
     EXTRA_ARGS=""
+
+    echo ">>> 服务端口: ${PORT}"
 
     # 层数设置
     if [ -n "${NUM_LAYERS}" ] && [ "${NUM_LAYERS}" -gt 0 ] 2>/dev/null; then
@@ -223,7 +225,10 @@ case "${1:-tp_dp}" in
         echo "  tools   - 带 Function Calling 和 Reasoning Parser"
         echo "  compile - 预编译 DeepGEMM kernels (只需运行一次)"
         echo ""
-        echo "配置项 (修改脚本顶部变量):"
+        echo "配置项 (可通过环境变量覆盖):"
+        echo ""
+        echo "  PORT              - 服务端口 (默认: 30000)"
+        echo "                      例如: PORT=31000 ./run.sh tp_dp"
         echo ""
         echo "  NUM_LAYERS        - 控制加载的层数"
         echo "                      例如: NUM_LAYERS=10 只加载前10层"
