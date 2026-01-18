@@ -26,6 +26,11 @@ NSA_SAVE_INTERVAL=""
 # 注意: 跳过预编译会导致首次推理时编译，建议先运行 './run.sh compile'
 SKIP_DEEPGEMM_PRECOMPILE="1"
 
+# NSA TopK Fuse 设置 (默认禁用以获取真实 token 索引，设置为1启用)
+# 注意: 启用 fuse 时，topk_indices 是变换后的 page table 索引，不是真实 token 位置
+# 收集数据分析时应禁用 (设为0)
+SGLANG_NSA_FUSE_TOPK="0"
+
 # 构建额外参数
 build_extra_args() {
     EXTRA_ARGS=""
@@ -75,6 +80,14 @@ build_extra_args() {
         echo ">>> DeepGEMM 预编译: 已跳过 (运行时按需编译)"
     else
         echo ">>> DeepGEMM 预编译: 已启用"
+    fi
+
+    # NSA TopK Fuse 设置
+    export SGLANG_NSA_FUSE_TOPK="${SGLANG_NSA_FUSE_TOPK:-0}"
+    if [ "${SGLANG_NSA_FUSE_TOPK}" = "0" ]; then
+        echo ">>> NSA TopK Fuse: 已禁用 (获取真实 token 索引)"
+    else
+        echo ">>> NSA TopK Fuse: 已启用 (topk_indices 为变换后的 page table)"
     fi
 }
 

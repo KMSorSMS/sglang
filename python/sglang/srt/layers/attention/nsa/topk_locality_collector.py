@@ -36,6 +36,7 @@ class TopKLocalityCollector:
     {
         "records": [  # 按时间顺序的记录（每层每次 forward 一条）
             {
+                "session_id": int,                      # 会话 ID（每次 prefill 开始新会话）
                 "layer_id": int,                        # 层编号
                 "topk_indices": Tensor (num_tokens, topk),  # 选中的 KV block 索引
                 "positions": Tensor (num_tokens,),      # 每个 query token 的位置
@@ -48,6 +49,7 @@ class TopKLocalityCollector:
         ],
         "metadata": {
             "total_records": int,
+            "total_sessions": int,
             "start_time": float,
             "save_time": float,
             "duration": float,
@@ -55,6 +57,7 @@ class TopKLocalityCollector:
     }
 
     数据解读:
+    - session_id: 每次 prefill (EXTEND) 开始时自增，用于区分不同 prompt
     - topk_indices[i] 是 positions[i] 位置的 query token 选择的 KV block 索引
     - Prefill: positions = [0, 1, ..., prompt_len-1], 一次处理所有 prompt tokens
     - Decode: positions = [current_pos], 每次处理一个新 token
@@ -78,6 +81,11 @@ class TopKLocalityCollector:
         self.total_records = 0
         self.start_time = time.time()
         self.file_counter = 0
+
+        # Session 追踪: 每次 prefill (EXTEND) 开始时递增
+        self.current_session_id = 0
+        self.total_sessions = 0
+        self._last_mode = None  # 用于检测 prefill 开始
 
         # 可读日志文件
         self.log_file = None
@@ -127,8 +135,18 @@ class TopKLocalityCollector:
         # 获取 forward_mode 的可读名称
         mode_name = forward_mode.name if forward_mode is not None else "unknown"
 
+        # 检测新 session: 当从 DECODE 切换到 EXTEND，或首次 EXTEND 时
+        # 只在 layer_id=0 时检测，避免同一个 prefill 的多层重复触发
+        if layer_id == 0 and mode_name == "EXTEND":
+            if self._last_mode != "EXTEND":
+                self.current_session_id += 1
+                self.total_sessions += 1
+                print(f"[TopKCollector] New session started: session_id={self.current_session_id}")
+        if layer_id == 0:
+            self._last_mode = mode_name
+
         # DEBUG: 打印调用信息
-        print(f"[TopKCollector DEBUG] record(): layer={layer_id}, mode={mode_name}, seq_len={seq_len}, num_tokens={positions.shape[0]}, total={self.total_records}")
+        print(f"[TopKCollector DEBUG] record(): session={self.current_session_id}, layer={layer_id}, mode={mode_name}, seq_len={seq_len}, num_tokens={positions.shape[0]}, total={self.total_records}")
 
         if not self.enabled:
             return
@@ -148,6 +166,7 @@ class TopKLocalityCollector:
 
         # 保存记录
         self.records.append({
+            "session_id": self.current_session_id,  # 会话 ID
             "layer_id": layer_id,
             "topk_indices": indices_cpu,           # (num_tokens, topk)
             "positions": positions_cpu,             # (num_tokens,) query 位置
@@ -160,7 +179,7 @@ class TopKLocalityCollector:
 
         # 写入可读日志
         if self.log_file is not None:
-            self._write_readable_log(layer_id, indices_cpu, positions_cpu, seq_len, mode_name)
+            self._write_readable_log(self.current_session_id, layer_id, indices_cpu, positions_cpu, seq_len, mode_name)
 
         self.total_records += 1
 
@@ -171,6 +190,7 @@ class TopKLocalityCollector:
 
     def _write_readable_log(
         self,
+        session_id: int,
         layer_id: int,
         indices: torch.Tensor,
         positions: torch.Tensor,
@@ -182,7 +202,7 @@ class TopKLocalityCollector:
         topk = indices.shape[1] if len(indices.shape) > 1 else 0
 
         # 写入头部信息（每个 forward 一行）
-        self.log_file.write(f"\n[Layer {layer_id}] {mode_name} | seq_len={seq_len} | tokens={num_tokens}\n")
+        self.log_file.write(f"\n[Session {session_id}][Layer {layer_id}] {mode_name} | seq_len={seq_len} | tokens={num_tokens}\n")
 
         # 每个 token 一行：pos -> top10 indices
         for i in range(num_tokens):
@@ -212,21 +232,25 @@ class TopKLocalityCollector:
             existing = torch.load(save_file, weights_only=False)
             existing["records"].extend(self.records)
             existing["metadata"]["total_records"] = len(existing["records"])
+            # 统计总 session 数
+            all_sessions = set(r.get("session_id", 0) for r in existing["records"])
+            existing["metadata"]["total_sessions"] = len(all_sessions)
             existing["metadata"]["save_time"] = time.time()
             existing["metadata"]["duration"] = time.time() - existing["metadata"]["start_time"]
             data = existing
-            print(f"[TopKCollector] Appended {appended_count} records, total: {len(existing['records'])}")
+            print(f"[TopKCollector] Appended {appended_count} records, total: {len(existing['records'])} ({len(all_sessions)} sessions)")
         else:
             data = {
                 "records": self.records,
                 "metadata": {
                     "total_records": len(self.records),
+                    "total_sessions": self.total_sessions,
                     "start_time": self.start_time,
                     "save_time": time.time(),
                     "duration": time.time() - self.start_time,
                 }
             }
-            print(f"[TopKCollector] Saved {len(self.records)} records to {save_file}")
+            print(f"[TopKCollector] Saved {len(self.records)} records ({self.total_sessions} sessions) to {save_file}")
 
         torch.save(data, save_file)
 
@@ -258,6 +282,9 @@ class TopKLocalityCollector:
             mode = record["forward_mode"]
             mode_counts[mode] = mode_counts.get(mode, 0) + 1
 
+        # 统计 session
+        session_ids = set(r.get("session_id", 0) for r in records)
+
         # 构建本次保存的记录
         lines = [
             f"",
@@ -266,6 +293,7 @@ class TopKLocalityCollector:
             f"{'=' * 50}",
             f"Main file: {main_file.name}",
             f"Total records: {len(records)}" + (f" (appended {appended_count})" if appended_count > 0 else ""),
+            f"Total sessions: {len(session_ids)} (session_ids: {sorted(session_ids)})",
             f"Duration: {metadata['duration']:.2f}s",
             f"",
             f"Per-layer counts:",

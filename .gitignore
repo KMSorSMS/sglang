@@ -267,3 +267,4 @@ python/sglang/srt/grpc/*_pb2.py
 python/sglang/srt/grpc/*_pb2_grpc.py
 python/sglang/srt/grpc/*_pb2.pyi
 topk_locality*
+longbench_v2_cache.json

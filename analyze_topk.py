@@ -31,18 +31,124 @@ def get_layer_ids(data: Dict) -> List[int]:
     return sorted(layer_ids)
 
 
+def get_session_ids(data: Dict) -> List[int]:
+    """获取数据中所有的 session ID"""
+    records = data.get("records", [])
+    session_ids = set()
+    for record in records:
+        session_ids.add(record.get("session_id", 0))
+    return sorted(session_ids)
+
+
+def filter_by_session(data: Dict, session_id: int) -> Dict:
+    """过滤指定 session 的数据"""
+    records = data.get("records", [])
+    filtered = [r for r in records if r.get("session_id", 0) == session_id]
+    return {
+        "records": filtered,
+        "metadata": {
+            **data.get("metadata", {}),
+            "total_records": len(filtered),
+            "filtered_session": session_id,
+        }
+    }
+
+
 def print_summary(data: Dict):
     """打印数据摘要"""
     metadata = data.get("metadata", {})
     records = data.get("records", [])
     layer_ids = get_layer_ids(data)
+    session_ids = get_session_ids(data)
 
     print("=" * 60)
     print("TopK Locality 数据摘要")
     print("=" * 60)
     print(f"总记录数: {metadata.get('total_records', len(records))}")
+    print(f"总 Session 数: {len(session_ids)} (IDs: {session_ids})")
     print(f"层数: {len(layer_ids)} (layers: {min(layer_ids)}-{max(layer_ids)})")
     print(f"采集时长: {metadata.get('duration', 0):.2f} 秒")
+    print()
+
+    # 按 session 统计 (只看 layer 0 的记录来统计 token 数)
+    session_stats = defaultdict(lambda: {"EXTEND": 0, "DECODE": 0, "total": 0, "prefill_tokens": 0, "decode_tokens": 0})
+    for record in records:
+        sid = record.get("session_id", 0)
+        mode = record.get("forward_mode", "unknown")
+        layer_id = record.get("layer_id", -1)
+        num_tokens = record.get("num_tokens", 0)
+
+        session_stats[sid][mode] = session_stats[sid].get(mode, 0) + 1
+        session_stats[sid]["total"] += 1
+
+        # 只用 layer 0 来统计 token 数量（避免重复计算）
+        if layer_id == layer_ids[0]:
+            if mode == "EXTEND":
+                session_stats[sid]["prefill_tokens"] += num_tokens
+            elif mode == "DECODE":
+                session_stats[sid]["decode_tokens"] += num_tokens
+
+    print("按 Session 统计:")
+    for sid in sorted(session_stats.keys()):
+        stats = session_stats[sid]
+        extend = stats.get("EXTEND", 0)
+        decode = stats.get("DECODE", 0)
+        prefill_tokens = stats.get("prefill_tokens", 0)
+        decode_tokens = stats.get("decode_tokens", 0)
+        print(f"  Session {sid}: {stats['total']} 条记录 (EXTEND: {extend}, DECODE: {decode})")
+        print(f"             Prefill 长度: {prefill_tokens} tokens, Decode 长度: {decode_tokens} tokens")
+    print()
+
+    # DEBUG: 检查 EXTEND 和 DECODE 的 position 范围
+    print("[DEBUG] Position 范围分析 (以 Layer 0 为例):")
+    for sid in sorted(session_stats.keys()):
+        sid_records = [r for r in records if r.get("session_id", 0) == sid and r.get("layer_id") == layer_ids[0]]
+
+        # EXTEND records
+        extend_records = [r for r in sid_records if r.get("forward_mode") == "EXTEND"]
+        extend_positions = []
+        for r in extend_records:
+            pos = r.get("positions")
+            if pos is not None:
+                extend_positions.extend(pos.tolist())
+
+        # DECODE records
+        decode_records_sid = [r for r in sid_records if r.get("forward_mode") == "DECODE"]
+        decode_positions = []
+        for r in decode_records_sid:
+            pos = r.get("positions")
+            if pos is not None:
+                decode_positions.extend(pos.tolist())
+
+        print(f"  Session {sid}:")
+        if extend_positions:
+            print(f"    EXTEND positions: min={min(extend_positions)}, max={max(extend_positions)}, count={len(extend_positions)}")
+            # 检查是否有 gap
+            sorted_ext = sorted(set(extend_positions))
+            if len(sorted_ext) > 1:
+                gaps = []
+                for i in range(1, len(sorted_ext)):
+                    gap = sorted_ext[i] - sorted_ext[i-1]
+                    if gap > 1:
+                        gaps.append((sorted_ext[i-1], sorted_ext[i], gap))
+                if gaps:
+                    print(f"    EXTEND gaps (大于1): {gaps[:5]}{'...' if len(gaps) > 5 else ''}")
+        else:
+            print(f"    EXTEND positions: (无数据)")
+
+        if decode_positions:
+            print(f"    DECODE positions: min={min(decode_positions)}, max={max(decode_positions)}, count={len(decode_positions)}")
+        else:
+            print(f"    DECODE positions: (无数据)")
+
+        # 检查 EXTEND 和 DECODE 之间的 gap
+        if extend_positions and decode_positions:
+            extend_max = max(extend_positions)
+            decode_min = min(decode_positions)
+            gap = decode_min - extend_max
+            print(f"    EXTEND->DECODE gap: {extend_max} -> {decode_min} = {gap} tokens")
+            if gap > 1:
+                print(f"    [警告] Gap 过大! 可能有数据丢失或 chunked prefill")
     print()
 
     # 按 forward_mode 统计
@@ -51,7 +157,7 @@ def print_summary(data: Dict):
         mode = record.get("forward_mode", "unknown")
         mode_counts[mode] = mode_counts.get(mode, 0) + 1
 
-    print("按模式统计:")
+    print("按模式统计 (全部):")
     for mode, count in sorted(mode_counts.items()):
         print(f"  {mode}: {count} 条记录")
     print()
@@ -119,7 +225,9 @@ def analyze_distance(data: Dict, layer_id: Optional[int] = None):
     print("=" * 60)
 
     all_distances = []
-    all_recency_ratios = []  # 最近 10% 位置的选择比例
+    # 多个 recency 阈值: 最近 10%, 30%, 50%, 70%, 90%
+    recency_thresholds = [0.1, 0.3, 0.5, 0.7, 0.9]
+    all_recency_ratios = {thresh: [] for thresh in recency_thresholds}
 
     for record in layer_records:
         positions = record.get("positions")
@@ -135,13 +243,31 @@ def analyze_distance(data: Dict, layer_id: Optional[int] = None):
 
             # 计算距离: query_pos - key_pos (正数表示 key 在 query 之前)
             distances = [query_pos - k for k in selected_keys]
+
+            # 调试: 打印负距离的情况
+            negative_keys = []
+            negative_dists = []
+            for k, d in zip(selected_keys, distances):
+                if d < 0:
+                    negative_keys.append(k)
+                    negative_dists.append(d)
+            if negative_keys:
+                print(f"[DEBUG] 负距离! query_pos={query_pos}")
+                print(f"        负的 selected_keys: {negative_keys[:20]}{'...' if len(negative_keys) > 20 else ''}")
+                print(f"        对应的 distances:   {negative_dists[:20]}{'...' if len(negative_dists) > 20 else ''}")
+
             all_distances.extend(distances)
 
-            # 计算 recency: 选择的 key 中有多少在最近 10% 的位置
+            # 计算多个 recency 阈值
             if query_pos > 0:
-                recent_threshold = max(1, int(query_pos * 0.9))  # 最近 10%
-                recent_count = sum(1 for k in selected_keys if k >= recent_threshold)
-                all_recency_ratios.append(recent_count / len(selected_keys))
+                for thresh in recency_thresholds:
+                    # thresh=0.1 表示最近 10%，即 key >= query_pos * 0.9
+                    recent_threshold = max(1, int(query_pos * (1 - thresh)))
+                    recent_count = sum(1 for k in selected_keys if k >= recent_threshold)
+                    all_recency_ratios[thresh].append(recent_count / len(selected_keys))
+            else:
+                # 应该不会存在这种情况
+                raise ValueError(f"Invalid query_pos: {query_pos}. Query position must be greater than 0.")
 
     if all_distances:
         distances_tensor = torch.tensor(all_distances, dtype=torch.float)
@@ -159,11 +285,13 @@ def analyze_distance(data: Dict, layer_id: Optional[int] = None):
             close_ratio = (distances_tensor.abs() <= threshold).float().mean().item()
             print(f"  距离 <= {threshold}: {close_ratio:.1%}")
 
-    if all_recency_ratios:
-        recency_tensor = torch.tensor(all_recency_ratios)
-        print(f"\nRecency 偏好 (选择最近 10% key 的比例):")
-        print(f"  平均: {recency_tensor.mean().item():.1%}")
-        print(f"  标准差: {recency_tensor.std().item():.1%}")
+    if all_recency_ratios[recency_thresholds[0]]:
+        print(f"\nRecency 偏好 (选择最近 X% key 的比例):")
+        for thresh in recency_thresholds:
+            ratios = all_recency_ratios[thresh]
+            recency_tensor = torch.tensor(ratios)
+            pct = int(thresh * 100)
+            print(f"  最近 {pct:2d}%: 平均 {recency_tensor.mean().item():.1%}, 标准差 {recency_tensor.std().item():.1%}")
 
 
 def analyze_cross_layer(data: Dict):
@@ -240,16 +368,22 @@ def analyze_decode_stability(data: Dict, layer_id: Optional[int] = None):
 
     # 计算连续 decode step 之间的重叠
     overlaps = []
+    step_pairs = []  # 记录 (prev_pos, curr_pos) 对
     prev_indices = None
+    prev_pos = None
     for record in decode_records:
         indices = record.get("topk_indices")
+        positions = record.get("positions")
         if indices is not None and indices.shape[0] == 1:
             curr_indices = set(indices[0].tolist())
+            curr_pos = positions[0].item() if positions is not None else None
             if prev_indices is not None:
                 if prev_indices or curr_indices:
                     jaccard = len(prev_indices & curr_indices) / len(prev_indices | curr_indices)
                     overlaps.append(jaccard)
+                    step_pairs.append((prev_pos, curr_pos))
             prev_indices = curr_indices
+            prev_pos = curr_pos
 
     if overlaps:
         overlaps_tensor = torch.tensor(overlaps)
@@ -259,156 +393,29 @@ def analyze_decode_stability(data: Dict, layer_id: Optional[int] = None):
         print(f"  最小: {overlaps_tensor.min().item():.1%}")
         print(f"  最大: {overlaps_tensor.max().item():.1%}")
 
-
-def plot_layer_overlap(records: list, layer_ids: list, output_dir, plt, np):
-    """分析并可视化跨层重叠（热点 KV cache 分析）"""
-    from collections import Counter
-
-    # 按 position 分组，收集每层的选择
-    # 对于 EXTEND (prefill)，一个 forward 有多个 position
-    # 对于 DECODE，一个 forward 只有一个 position
-
-    # 收集数据：position -> layer -> set of selected indices
-    pos_layer_indices = defaultdict(lambda: defaultdict(set))
-
-    for record in records:
-        layer_id = record.get("layer_id")
-        positions = record.get("positions")
-        indices = record.get("topk_indices")
-
-        if positions is None or indices is None:
-            continue
-
-        for i in range(positions.shape[0]):
-            pos = positions[i].item()
-            selected = set(indices[i].tolist())
-            pos_layer_indices[pos][layer_id] = selected
-
-    if not pos_layer_indices:
-        print("  没有足够的数据进行跨层重叠分析")
-        return
-
-    # 只分析所有层都有数据的 position
-    valid_positions = [pos for pos, layer_dict in pos_layer_indices.items()
-                       if len(layer_dict) == len(layer_ids)]
-    valid_positions = sorted(valid_positions)
-
-    if not valid_positions:
-        print("  没有所有层都有数据的 position")
-        return
-
-    print(f"  有效 position 数: {len(valid_positions)}")
-
-    # ========== 分析 1: 每个 position 的跨层重叠度 ==========
-    # 计算：intersection(所有层选择) / union(所有层选择)
-    overlap_ratios = []  # 全层交集占比
-    hot_counts = []  # 被多层选中的 KV 数量
-
-    for pos in valid_positions:
-        layer_dict = pos_layer_indices[pos]
-        all_sets = [layer_dict[lid] for lid in layer_ids]
-
-        # 全层交集
-        intersection = set.intersection(*all_sets)
-        union = set.union(*all_sets)
-
-        overlap_ratio = len(intersection) / len(union) if union else 0
-        overlap_ratios.append(overlap_ratio)
-
-        # 统计每个 KV index 被多少层选中
-        kv_counter = Counter()
-        for s in all_sets:
-            kv_counter.update(s)
-
-        # "热点" = 被超过一半层选中的 KV
-        hot_threshold = len(layer_ids) // 2 + 1
-        hot_count = sum(1 for count in kv_counter.values() if count >= hot_threshold)
-        hot_counts.append(hot_count)
-
-    # ========== 分析 2: 全局热点 KV 统计 ==========
-    # 统计每个 KV index 在所有 position 的所有层中被选中的总次数
-    global_kv_counter = Counter()
-    for pos in valid_positions:
-        layer_dict = pos_layer_indices[pos]
-        for lid in layer_ids:
-            global_kv_counter.update(layer_dict[lid])
-
-    # 找出最热门的 KV positions
-    top_hot_kvs = global_kv_counter.most_common(20)
-
-    print(f"  全层交集占比 (Jaccard): 平均 {np.mean(overlap_ratios):.1%}, 最大 {max(overlap_ratios):.1%}")
-    print(f"  热点 KV 数量 (被 >50% 层选中): 平均 {np.mean(hot_counts):.1f}")
-    print(f"  Top 10 最热 KV positions: {[kv for kv, _ in top_hot_kvs[:10]]}")
-
-    # ========== 绘图 ==========
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-
-    # 图1: 跨层重叠度随 position 变化
-    ax1 = axes[0, 0]
-    ax1.plot(valid_positions, overlap_ratios, marker='.', markersize=2, alpha=0.7)
-    ax1.axhline(y=np.mean(overlap_ratios), color='r', linestyle='--',
-                label=f'mean: {np.mean(overlap_ratios):.1%}')
-    ax1.set_xlabel("Query Position")
-    ax1.set_ylabel("All-Layer Intersection / Union")
-    ax1.set_title("Cross-Layer Overlap Ratio per Position")
-    ax1.legend()
-    ax1.set_ylim(0, 1)
-
-    # 图2: 热点 KV 数量随 position 变化
-    ax2 = axes[0, 1]
-    ax2.plot(valid_positions, hot_counts, marker='.', markersize=2, alpha=0.7)
-    ax2.axhline(y=np.mean(hot_counts), color='r', linestyle='--',
-                label=f'mean: {np.mean(hot_counts):.1f}')
-    ax2.set_xlabel("Query Position")
-    ax2.set_ylabel("Hot KV Count (selected by >50% layers)")
-    ax2.set_title("Hot KV Cache Count per Position")
-    ax2.legend()
-
-    # 图3: 全局 KV 热度分布（直方图）
-    ax3 = axes[1, 0]
-    kv_frequencies = list(global_kv_counter.values())
-    ax3.hist(kv_frequencies, bins=50, alpha=0.7, edgecolor='black')
-    ax3.set_xlabel("Selection Frequency (across all positions & layers)")
-    ax3.set_ylabel("Number of KV Positions")
-    ax3.set_title("KV Cache Hotness Distribution")
-    ax3.axvline(x=np.mean(kv_frequencies), color='r', linestyle='--',
-                label=f'mean: {np.mean(kv_frequencies):.1f}')
-    ax3.legend()
-
-    # 图4: Top 20 最热 KV 的频率
-    ax4 = axes[1, 1]
-    if top_hot_kvs:
-        kv_positions = [str(kv) for kv, _ in top_hot_kvs]
-        kv_freqs = [freq for _, freq in top_hot_kvs]
-        ax4.barh(range(len(kv_positions)), kv_freqs)
-        ax4.set_yticks(range(len(kv_positions)))
-        ax4.set_yticklabels(kv_positions)
-        ax4.set_xlabel("Selection Frequency")
-        ax4.set_ylabel("KV Position")
-        ax4.set_title("Top 20 Hottest KV Positions")
-        ax4.invert_yaxis()  # 最热的在上面
-
-    plt.suptitle(f"Cross-Layer KV Cache Overlap Analysis ({len(layer_ids)} layers, {len(valid_positions)} positions)")
-    plt.tight_layout()
-    output_file = output_dir / "topk_layer_overlap.png"
-    plt.savefig(output_file, dpi=150)
-    print(f"  跨层重叠分析图已保存到: {output_file}")
-    plt.close()
-
-    # ========== 额外分析：热点 KV 的位置特征 ==========
-    # 热点 KV 是靠近开头还是靠近当前位置？
-    if top_hot_kvs and valid_positions:
-        hot_kv_positions = [kv for kv, _ in top_hot_kvs[:10]]
-        avg_query_pos = np.mean(valid_positions)
-        hot_kv_avg = np.mean(hot_kv_positions)
-        print(f"  热点 KV 位置特征:")
-        print(f"    平均 query position: {avg_query_pos:.0f}")
-        print(f"    Top10 热点 KV 平均位置: {hot_kv_avg:.0f}")
-        print(f"    热点倾向: {'靠近开头 (可能是重要 context)' if hot_kv_avg < avg_query_pos * 0.5 else '靠近当前位置 (recency bias)' if hot_kv_avg > avg_query_pos * 0.8 else '分布较均匀'}")
+        # 打印逐步重叠详情 (前5个 + 后5个)
+        print(f"\n  逐步重叠详情 (共 {len(overlaps)} 步):")
+        show_n = 5
+        for i in range(min(show_n, len(overlaps))):
+            prev_p, curr_p = step_pairs[i]
+            print(f"    step {prev_p} -> {curr_p}: {overlaps[i]:.1%}")
+        if len(overlaps) > show_n * 2:
+            print(f"    ... (省略 {len(overlaps) - show_n * 2} 步) ...")
+        if len(overlaps) > show_n:
+            for i in range(max(show_n, len(overlaps) - show_n), len(overlaps)):
+                prev_p, curr_p = step_pairs[i]
+                print(f"    step {prev_p} -> {curr_p}: {overlaps[i]:.1%}")
 
 
-def plot_all(data: Dict, output_dir: str = "."):
-    """生成所有可视化图表"""
+def plot_intra_layer_similarity(data: Dict, output_dir: str = "."):
+    """
+    绘制论文风格的 Intra-Layer Similarity 热力图
+    复现 ESS 论文 (arxiv 2512.10576) 的图表风格
+
+    X 轴: Layer IDs
+    Y 轴: Context Length (不同 session 对应不同的 prompt 长度)
+    颜色: Jaccard Similarity (每个 session 在该 layer 的平均相似度)
+    """
     try:
         import matplotlib.pyplot as plt
         import numpy as np
@@ -416,309 +423,239 @@ def plot_all(data: Dict, output_dir: str = "."):
         print("需要安装 matplotlib: pip install matplotlib")
         return
 
-    print("\n" + "=" * 60)
-    print("生成可视化图表")
-    print("=" * 60)
-    print("输出文件:")
-    print("  1. topk_locality_analysis.png - 基础统计 (2x2)")
-    print("     - 左上: Query-Key 距离分布")
-    print("     - 右上: Recency 偏好")
-    print("     - 左下: 相邻层一致性")
-    print("     - 右下: Decode 趋势")
-    print("  2. topk_layer_overlap.png - 跨层重叠分析 (2x2) ★重要")
-    print("     - 左上: 跨层重叠度随 position 变化")
-    print("     - 右上: 热点 KV 数量随 position 变化")
-    print("     - 左下: KV 热度分布直方图")
-    print("     - 右下: Top 20 最热 KV positions")
-    print("  3. topk_prefill_heatmap.png - 多层 Prefill 热力图")
-    print("  4. topk_decode_heatmap.png - 多层 Decode 热力图")
-    print()
-
-    output_dir = Path(output_dir)
     records = data.get("records", [])
     layer_ids = get_layer_ids(data)
-    print(f"[DEBUG] Total records: {len(records)}, Layers: {layer_ids}")
+    session_ids = get_session_ids(data)
+    output_dir = Path(output_dir)
 
-    # ========== 图1: Query-Key 距离分布 (多层对比) ==========
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    print("=" * 60)
+    print("绘制 Intra-Layer Similarity 热力图 (论文风格)")
+    print("=" * 60)
 
-    ax1 = axes[0, 0]
-    layer_distances = {}
-    for layer_id in layer_ids:
-        layer_records = [r for r in records if r.get("layer_id") == layer_id]
-        distances = []
-        for record in layer_records:
-            positions = record.get("positions")
-            indices = record.get("topk_indices")
-            if positions is None or indices is None:
+    # 为每个 session 的每层计算平均 Jaccard 相似度
+    # 结构: {session_id: {layer_id: mean_similarity}}
+    session_layer_similarity = {sid: {} for sid in session_ids}
+
+    # 同时记录每个 session 的 context length (用于 Y 轴标签)
+    session_context_len = {}
+
+    for session_id in session_ids:
+        for layer_id in layer_ids:
+            # 获取该 session 该 layer 的所有记录 (EXTEND + DECODE)
+            layer_records = [r for r in records
+                              if r.get("layer_id") == layer_id
+                              and r.get("session_id", 0) == session_id]
+
+            if not layer_records:
                 continue
-            for i in range(positions.shape[0]):
-                query_pos = positions[i].item()
-                selected_keys = indices[i].tolist()
-                distances.extend([query_pos - k for k in selected_keys])
-        if distances:
-            layer_distances[layer_id] = distances
 
-    # 绘制每层的距离分布箱线图
-    print(f"[DEBUG] Distance data: {len(layer_distances)} layers with data")
-    if layer_distances:
-        box_data = [layer_distances[lid] for lid in sorted(layer_distances.keys())]
-        box_labels = [f"L{lid}" for lid in sorted(layer_distances.keys())]
-        ax1.boxplot(box_data, tick_labels=box_labels, showfliers=False)
-        ax1.set_xlabel("Layer")
-        ax1.set_ylabel("Query-Key Distance")
-        ax1.set_title("Query-Key Distance Distribution per Layer")
-        ax1.axhline(y=0, color='r', linestyle='--', alpha=0.5)
-    else:
-        ax1.set_title("No Distance Data")
+            # 收集所有 (position, indices) 对，然后按 position 排序
+            pos_indices_list = []  # [(pos, indices_set), ...]
 
-    # ========== 图2: Recency 偏好 per Layer ==========
-    ax2 = axes[0, 1]
-    layer_recency = {}
-    for layer_id in layer_ids:
-        layer_records = [r for r in records if r.get("layer_id") == layer_id]
-        recency_ratios = []
-        for record in layer_records:
-            positions = record.get("positions")
-            indices = record.get("topk_indices")
-            if positions is None or indices is None:
+            for record in layer_records:
+                indices = record.get("topk_indices")
+                positions = record.get("positions")
+
+                if indices is None or positions is None:
+                    continue
+
+                # EXTEND: 多个 position; DECODE: 单个 position
+                for i in range(positions.shape[0]):
+                    pos = positions[i].item()
+                    idx_set = set(indices[i].tolist())
+                    pos_indices_list.append((pos, idx_set))
+
+            # 按 position 排序
+            pos_indices_list.sort(key=lambda x: x[0])
+
+            if len(pos_indices_list) < 2:
                 continue
-            for i in range(positions.shape[0]):
-                query_pos = positions[i].item()
-                if query_pos > 10:  # 只统计有足够历史的 query
-                    selected_keys = indices[i].tolist()
-                    recent_threshold = int(query_pos * 0.9)
-                    recent_count = sum(1 for k in selected_keys if k >= recent_threshold)
-                    recency_ratios.append(recent_count / len(selected_keys))
-        if recency_ratios:
-            layer_recency[layer_id] = np.mean(recency_ratios)
 
-    print(f"[DEBUG] Recency data: {len(layer_recency)} layers with data")
-    if layer_recency:
-        ax2.bar(layer_recency.keys(), layer_recency.values())
-        ax2.set_xlabel("Layer ID")
-        ax2.set_ylabel("Recency Ratio")
-        ax2.set_title("Recency Preference per Layer\n(% of keys in last 10% positions)")
-        ax2.set_ylim(0, 1)
-    else:
-        ax2.set_title("No Recency Data")
+            # 计算相邻 position 的 Jaccard 相似度
+            similarities = []
+            max_pos = 0
 
-    # ========== 图3: 跨层一致性 ==========
-    ax3 = axes[1, 0]
-    decode_records = [r for r in records if r.get("forward_mode") == "DECODE"]
+            for i in range(1, len(pos_indices_list)):
+                prev_pos, prev_indices = pos_indices_list[i - 1]
+                curr_pos, curr_indices = pos_indices_list[i]
+                max_pos = max(max_pos, curr_pos)
 
-    pos_to_layers = defaultdict(dict)
-    for record in decode_records:
-        positions = record.get("positions")
-        indices = record.get("topk_indices")
-        layer_id = record.get("layer_id")
-        if positions is not None and indices is not None and positions.shape[0] == 1:
-            pos = positions[0].item()
-            pos_to_layers[pos][layer_id] = set(indices[0].tolist())
+                if prev_indices or curr_indices:
+                    jaccard = len(prev_indices & curr_indices) / len(prev_indices | curr_indices)
+                else:
+                    jaccard = 1.0
+                similarities.append(jaccard)
 
-    layer_pairs_overlap = {}
-    for i in range(len(layer_ids) - 1):
-        l1, l2 = layer_ids[i], layer_ids[i + 1]
-        overlaps = []
-        for pos, layer_dict in pos_to_layers.items():
-            if l1 in layer_dict and l2 in layer_dict:
-                set1, set2 = layer_dict[l1], layer_dict[l2]
-                if set1 or set2:
-                    jaccard = len(set1 & set2) / len(set1 | set2)
-                    overlaps.append(jaccard)
-        if overlaps:
-            layer_pairs_overlap[f"L{l1}-L{l2}"] = np.mean(overlaps)
+            if similarities:
+                session_layer_similarity[session_id][layer_id] = np.mean(similarities)
+                session_context_len[session_id] = max_pos
 
-    print(f"[DEBUG] Cross-layer data: {len(layer_pairs_overlap)} layer pairs")
-    if layer_pairs_overlap:
-        ax3.bar(range(len(layer_pairs_overlap)), list(layer_pairs_overlap.values()))
-        ax3.set_xticks(range(len(layer_pairs_overlap)))
-        ax3.set_xticklabels(list(layer_pairs_overlap.keys()), rotation=45)
-        ax3.set_xlabel("Layer Pair")
-        ax3.set_ylabel("Jaccard Similarity")
-        ax3.set_title("Cross-Layer Consistency\n(Adjacent Layer Similarity)")
-        ax3.set_ylim(0, 1)
-    else:
-        ax3.set_title("No Cross-Layer Data")
+    # 过滤掉没有数据的 session
+    valid_sessions = [sid for sid in session_ids if session_layer_similarity[sid]]
+    if not valid_sessions:
+        print("没有足够的数据 (需要至少 2 个 position)")
+        return
 
-    # ========== 图4: Decode 过程中 mean index 变化 ==========
-    ax4 = axes[1, 1]
-    first_layer = layer_ids[0]
-    layer_decode_records = [r for r in decode_records if r.get("layer_id") == first_layer]
-    print(f"[DEBUG] Decode records for layer {first_layer}: {len(layer_decode_records)}")
+    # 按 context length 排序 session
+    valid_sessions = sorted(valid_sessions, key=lambda s: session_context_len.get(s, 0))
 
-    if layer_decode_records:
-        layer_decode_records = sorted(layer_decode_records,
-                                       key=lambda r: r.get("positions", torch.tensor([0]))[0].item())
-        query_positions = []
-        mean_indices = []
-        for r in layer_decode_records[:200]:  # 最多显示 200 个点
-            positions = r.get("positions")
-            indices = r.get("topk_indices")
-            if positions is not None and indices is not None:
-                query_positions.append(positions[0].item())
-                mean_indices.append(indices.float().mean().item())
+    print(f"有效 Session 数: {len(valid_sessions)}")
+    print(f"Layer 数量: {len(layer_ids)}")
+    for sid in valid_sessions:
+        ctx_len = session_context_len.get(sid, 0)
+        print(f"  Session {sid}: Context Length ≈ {ctx_len}")
 
-        print(f"[DEBUG] Decode trend data points: {len(mean_indices)}")
-        if mean_indices:
-            ax4.plot(query_positions, mean_indices, marker=".", markersize=3, alpha=0.7, label='mean index')
-            # 添加 y=x 参考线（表示选择的 key 平均位置等于 query 位置）
-            ax4.plot(query_positions, query_positions, 'r--', alpha=0.5, label='y=x')
-            ax4.set_xlabel("Query Position")
-            ax4.set_ylabel("Mean Selected Key Index")
-            ax4.set_title(f"Index Trend During Decoding (Layer {first_layer})")
-            ax4.legend()
-        else:
-            ax4.set_title(f"No Decode Data (Layer {first_layer})")
-    else:
-        ax4.set_title("No Decode Records")
+    # 构建热力图矩阵
+    # 行: session (context length), 列: layer id
+    heatmap_data = np.zeros((len(valid_sessions), len(layer_ids)))
+
+    for i, sid in enumerate(valid_sessions):
+        for j, lid in enumerate(layer_ids):
+            heatmap_data[i, j] = session_layer_similarity[sid].get(lid, np.nan)
+
+    # ==================== 绘制热力图 ====================
+    fig, ax = plt.subplots(figsize=(max(12, len(layer_ids) * 0.5), max(4, len(valid_sessions) * 0.5)))
+
+    im = ax.imshow(heatmap_data, aspect='auto', cmap='YlGnBu',
+                   vmin=0, vmax=1, interpolation='nearest')
+
+    # 设置坐标轴
+    ax.set_xlabel("Layer IDs", fontsize=12)
+    ax.set_ylabel("Context Length", fontsize=12)
+    ax.set_title("Intra-Layer Similarity Across Different Context Lengths", fontsize=14)
+
+    # X 轴: Layer IDs
+    ax.set_xticks(range(len(layer_ids)))
+    ax.set_xticklabels(layer_ids)
+
+    # Y 轴: Context Length (来自 session)
+    ax.set_yticks(range(len(valid_sessions)))
+    y_labels = [str(session_context_len.get(sid, f"S{sid}")) for sid in valid_sessions]
+    ax.set_yticklabels(y_labels)
+
+    # 添加 colorbar
+    cbar = plt.colorbar(im, ax=ax, label="Similarity")
 
     plt.tight_layout()
-    output_file = output_dir / "topk_locality_analysis.png"
-    plt.savefig(output_file, dpi=150)
-    print(f"分析图已保存到: {output_file}")
+    output_file = output_dir / "intra_layer_similarity.png"
+    plt.savefig(output_file, dpi=150, bbox_inches='tight')
+    print(f"热力图已保存到: {output_file}")
     plt.close()
 
-    # ========== 图5: 跨层重叠分析 ==========
-    print("\n[分析跨层重叠...]")
-    plot_layer_overlap(records, layer_ids, output_dir, plt, np)
+    # ==================== 打印统计信息 ====================
+    print("\n各层平均相似度 (跨所有 context length):")
+    for j, lid in enumerate(layer_ids):
+        col_data = heatmap_data[:, j]
+        valid_data = col_data[~np.isnan(col_data)]
+        if len(valid_data) > 0:
+            print(f"  Layer {lid}: {np.mean(valid_data):.1%}")
 
-    # ========== 图6: 多层热力图对比 ==========
-    prefill_records = [r for r in records if r.get("forward_mode") == "EXTEND"]
-    print(f"[DEBUG] Total prefill records: {len(prefill_records)}")
 
-    if prefill_records:
-        # 收集每层的数据
-        layer_data = {}
-        for layer_id in layer_ids:
-            layer_prefill = [r for r in prefill_records if r.get("layer_id") == layer_id]
-            if layer_prefill:
-                all_indices = []
-                all_positions = []
-                for record in layer_prefill:
-                    indices = record.get("topk_indices")
-                    positions = record.get("positions")
-                    if indices is not None and positions is not None:
-                        all_indices.append(indices)
-                        all_positions.append(positions)
-                if all_indices:
-                    layer_data[layer_id] = {
-                        "indices": torch.cat(all_indices, dim=0),
-                        "positions": torch.cat(all_positions, dim=0),
-                    }
+def plot_decode_stability(data: Dict, output_dir: str = "."):
+    """绘制多层 Decode 稳定性图 (Jaccard 重叠度)"""
+    try:
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ImportError:
+        print("需要安装 matplotlib: pip install matplotlib")
+        return
 
-        print(f"[DEBUG] Layers with prefill data: {list(layer_data.keys())}")
+    records = data.get("records", [])
+    layer_ids = get_layer_ids(data)
+    output_dir = Path(output_dir)
 
-        if layer_data:
-            n_layers = len(layer_data)
+    print("=" * 60)
+    print("绘制 Decode 稳定性图 (多层叠加)")
+    print("=" * 60)
 
-            # 找到所有层共有的 token 范围
-            min_tokens = min(d["indices"].shape[0] for d in layer_data.values())
-            n_tokens = min(50, min_tokens)  # 取前 50 个 token 对比
-            topk = layer_data[layer_ids[0]]["indices"].shape[1]
-            topk_to_show = min(20, topk)  # 只显示前 20 个 topk
+    # 为每层计算 decode 稳定性
+    layer_data = {}  # layer_id -> {"positions": [...], "overlaps": [...]}
 
-            # 使用 gridspec 来更好地控制布局
-            fig = plt.figure(figsize=(4 * n_layers + 1, 5))
-            gs = fig.add_gridspec(1, n_layers + 1, width_ratios=[1] * n_layers + [0.05])
+    for layer_id in layer_ids:
+        # 获取该层的 DECODE 记录，按 position 排序
+        decode_records = [r for r in records
+                          if r.get("forward_mode") == "DECODE" and r.get("layer_id") == layer_id]
+        decode_records = sorted(decode_records,
+                                 key=lambda r: r.get("positions", torch.tensor([0]))[0].item())
 
-            axes = []
-            for idx, layer_id in enumerate(sorted(layer_data.keys())):
-                ax = fig.add_subplot(gs[0, idx])
-                axes.append(ax)
+        if len(decode_records) < 2:
+            continue
 
-                data = layer_data[layer_id]
-                indices = data["indices"][:n_tokens, :topk_to_show]
-                positions = data["positions"][:n_tokens]
+        positions = []
+        overlaps = []
+        prev_indices = None
 
-                im = ax.imshow(indices.numpy(), aspect="auto", cmap="viridis")
-                ax.set_title(f"Layer {layer_id}", fontsize=10)
-                ax.set_xlabel("TopK Rank", fontsize=8)
-                if idx == 0:
-                    ax.set_ylabel("Query Position", fontsize=8)
+        for record in decode_records:
+            indices = record.get("topk_indices")
+            pos = record.get("positions")
 
-                # Y 轴: 均匀选取 6 个刻度
-                n_yticks = min(6, n_tokens)
-                ytick_indices = np.linspace(0, n_tokens - 1, n_yticks, dtype=int)
-                ax.set_yticks(ytick_indices)
-                ax.set_yticklabels([f"{positions[i].item()}" for i in ytick_indices], fontsize=7)
-                ax.tick_params(axis='x', labelsize=7)
+            if indices is not None and pos is not None and indices.shape[0] == 1:
+                curr_indices = set(indices[0].tolist())
+                curr_pos = pos[0].item()
 
-            # 添加 colorbar
-            cax = fig.add_subplot(gs[0, -1])
-            fig.colorbar(im, cax=cax, label="Selected KV Index")
+                if prev_indices is not None:
+                    # 计算 Jaccard 相似度
+                    if prev_indices or curr_indices:
+                        jaccard = len(prev_indices & curr_indices) / len(prev_indices | curr_indices)
+                    else:
+                        jaccard = 1.0
+                    positions.append(curr_pos)
+                    overlaps.append(jaccard)
 
-            plt.suptitle(f"TopK Indices Heatmap - Prefill\n(first {n_tokens} tokens, top {topk_to_show} ranks)", fontsize=11)
-            plt.tight_layout(rect=[0, 0, 1, 0.95])
-            output_file = output_dir / "topk_prefill_heatmap.png"
-            plt.savefig(output_file, dpi=150)
-            print(f"多层热力图已保存到: {output_file}")
-            plt.close()
+                prev_indices = curr_indices
 
-            # ========== 图6: 多层 Decode 热力图（如果有足够数据）==========
-            if decode_records:
-                # 收集每层的 decode 数据
-                layer_decode_data = {}
-                for layer_id in layer_ids:
-                    layer_dec = [r for r in decode_records if r.get("layer_id") == layer_id]
-                    layer_dec = sorted(layer_dec, key=lambda r: r.get("positions", torch.tensor([0]))[0].item())
-                    if layer_dec:
-                        all_indices = []
-                        all_positions = []
-                        for record in layer_dec:
-                            indices = record.get("topk_indices")
-                            positions = record.get("positions")
-                            if indices is not None and positions is not None:
-                                all_indices.append(indices)
-                                all_positions.append(positions)
-                        if all_indices:
-                            layer_decode_data[layer_id] = {
-                                "indices": torch.cat(all_indices, dim=0),
-                                "positions": torch.cat(all_positions, dim=0),
-                            }
+        if positions:
+            layer_data[layer_id] = {"positions": positions, "overlaps": overlaps}
 
-                if layer_decode_data:
-                    n_layers = len(layer_decode_data)
+    if not layer_data:
+        print("没有足够的 DECODE 数据")
+        return
 
-                    min_steps = min(d["indices"].shape[0] for d in layer_decode_data.values())
-                    n_steps = min(50, min_steps)
-                    topk = layer_decode_data[layer_ids[0]]["indices"].shape[1]
-                    topk_to_show = min(20, topk)
+    # 绘图
+    fig, ax = plt.subplots(figsize=(14, 6))
 
-                    # 使用 gridspec 来更好地控制布局
-                    fig = plt.figure(figsize=(4 * n_layers + 1, 5))
-                    gs = fig.add_gridspec(1, n_layers + 1, width_ratios=[1] * n_layers + [0.05])
+    # 使用不同颜色绘制每层
+    colors = plt.cm.tab10(np.linspace(0, 1, len(layer_ids)))
 
-                    for idx, layer_id in enumerate(sorted(layer_decode_data.keys())):
-                        ax = fig.add_subplot(gs[0, idx])
+    for idx, layer_id in enumerate(sorted(layer_data.keys())):
+        data_layer = layer_data[layer_id]
+        positions = data_layer["positions"]
+        overlaps = data_layer["overlaps"]
 
-                        data = layer_decode_data[layer_id]
-                        indices = data["indices"][:n_steps, :topk_to_show]
-                        positions = data["positions"][:n_steps]
+        ax.plot(positions, overlaps,
+                label=f"Layer {layer_id}",
+                color=colors[idx],
+                alpha=0.7,
+                linewidth=1.5)
 
-                        im = ax.imshow(indices.numpy(), aspect="auto", cmap="viridis")
-                        ax.set_title(f"Layer {layer_id}", fontsize=10)
-                        ax.set_xlabel("TopK Rank", fontsize=8)
-                        if idx == 0:
-                            ax.set_ylabel("Query Position", fontsize=8)
+    ax.set_xlabel("Query Position (Decode Step)", fontsize=12)
+    ax.set_ylabel("Jaccard Similarity with Previous Step", fontsize=12)
+    ax.set_title("Decode Stability: Consecutive Step Overlap (All Layers)", fontsize=14)
+    ax.set_ylim(0, 1.05)
+    ax.legend(loc="lower right", fontsize=9)
+    ax.grid(True, alpha=0.3)
 
-                        # Y 轴: 均匀选取 6 个刻度
-                        n_yticks = min(6, n_steps)
-                        ytick_indices = np.linspace(0, n_steps - 1, n_yticks, dtype=int)
-                        ax.set_yticks(ytick_indices)
-                        ax.set_yticklabels([f"{positions[i].item()}" for i in ytick_indices], fontsize=7)
-                        ax.tick_params(axis='x', labelsize=7)
+    # 添加平均线
+    all_overlaps = []
+    for layer_id in layer_data:
+        all_overlaps.extend(layer_data[layer_id]["overlaps"])
+    if all_overlaps:
+        avg = np.mean(all_overlaps)
+        ax.axhline(y=avg, color='red', linestyle='--', alpha=0.5, label=f'Overall Mean: {avg:.1%}')
+        # 更新图例
+        ax.legend(loc="lower right", fontsize=9)
 
-                    # 添加 colorbar
-                    cax = fig.add_subplot(gs[0, -1])
-                    fig.colorbar(im, cax=cax, label="Selected KV Index")
+    plt.tight_layout()
+    output_file = output_dir / "decode_stability.png"
+    plt.savefig(output_file, dpi=150)
+    print(f"图表已保存到: {output_file}")
+    plt.close()
 
-                    plt.suptitle(f"TopK Indices Heatmap - Decode\n(first {n_steps} steps, top {topk_to_show} ranks)", fontsize=11)
-                    plt.tight_layout(rect=[0, 0, 1, 0.95])
-                    output_file = output_dir / "topk_decode_heatmap.png"
-                    plt.savefig(output_file, dpi=150)
-                    print(f"Decode 热力图已保存到: {output_file}")
-                    plt.close()
+    # 打印统计信息
+    print("\n各层统计:")
+    for layer_id in sorted(layer_data.keys()):
+        overlaps = layer_data[layer_id]["overlaps"]
+        print(f"  Layer {layer_id}: mean={np.mean(overlaps):.1%}, std={np.std(overlaps):.1%}, n={len(overlaps)}")
 
 
 def main():
@@ -729,6 +666,8 @@ def main():
                         help="显示的记录数量 (0=不显示)")
     parser.add_argument("--layer", "-l", type=int, default=None,
                         help="分析的层 ID (默认=第一层)")
+    parser.add_argument("--session", "-s", type=int, default=None,
+                        help="只分析指定的 session ID (默认=全部)")
     parser.add_argument("--plot", "-p", action="store_true",
                         help="生成可视化图表")
     parser.add_argument("--output", "-o", type=str, default=".",
@@ -748,8 +687,19 @@ def main():
     print(f"加载数据: {file_path}")
     data = load_data(str(file_path))
 
-    # 打印摘要
+    # 打印摘要（全量数据）
     print_summary(data)
+
+    # 如果指定了 session，过滤数据
+    if args.session is not None:
+        session_ids = get_session_ids(data)
+        if args.session not in session_ids:
+            print(f"错误: session_id={args.session} 不存在，可用的 session IDs: {session_ids}")
+            return
+        print(f">>> 过滤 Session {args.session} 的数据进行分析")
+        data = filter_by_session(data, args.session)
+        print(f">>> 过滤后记录数: {len(data['records'])}")
+        print()
 
     # 打印原始记录
     if args.records > 0:
@@ -766,7 +716,8 @@ def main():
 
     # 生成图表
     if args.plot:
-        plot_all(data, args.output)
+        plot_decode_stability(data, args.output)
+        plot_intra_layer_similarity(data, args.output)
 
 
 if __name__ == "__main__":
