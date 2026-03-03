@@ -24,6 +24,7 @@ _MP_LAYER_ENTRIES = None
 _MP_INCLUDE_GAPS = False
 _MP_PER_SESSION = False
 _MP_RECORDS = None
+_MP_COLLECT_PER_SESSION_STATS = False
 
 
 def _mp_worker_compute_layer_overlap_from_record_idxs(packed_args):
@@ -36,6 +37,7 @@ def _mp_worker_compute_layer_overlap_from_record_idxs(packed_args):
     records = _MP_RECORDS
     include_gaps = _MP_INCLUDE_GAPS
     per_session = _MP_PER_SESSION
+    collect_stats = _MP_COLLECT_PER_SESSION_STATS
 
     if records is None or not record_indices:
         return {"layer_id": layer_id, "steps": 0, "has_data": False, "per_session": []}
@@ -84,7 +86,7 @@ def _mp_worker_compute_layer_overlap_from_record_idxs(packed_args):
             layer_overlaps.append(jaccard)
             prev_pos, prev_set = curr_pos, curr_set
 
-        if per_session and overlaps:
+        if (per_session or collect_stats) and overlaps:
             t = torch.tensor(overlaps, dtype=torch.float)
             per_session_stats.append(
                 {
@@ -122,6 +124,7 @@ def _mp_worker_compute_layer_overlap(layer_id: int):
     layer_entries = _MP_LAYER_ENTRIES.get(layer_id, []) if _MP_LAYER_ENTRIES is not None else []
     include_gaps = _MP_INCLUDE_GAPS
     per_session = _MP_PER_SESSION
+    collect_stats = _MP_COLLECT_PER_SESSION_STATS
 
     # entries: list[(session_id, position, tuple[int,...])]
     if len(layer_entries) < 2:
@@ -181,7 +184,7 @@ def _mp_worker_compute_layer_overlap(layer_id: int):
 
         prev_pos, prev_tuple = pos, idx_tuple
 
-    if per_session:
+    if per_session or collect_stats:
         _flush_session(prev_sid, current_overlaps)
 
     if not layer_overlaps:
@@ -203,10 +206,12 @@ def _mp_worker_compute_layer_overlap(layer_id: int):
 def _spawn_worker_compute_layer_overlap(packed_args):
     """Picklable wrapper for non-fork start methods (spawn/forkserver)."""
     lid, entries, include_gaps_local, per_session_local = packed_args
-    global _MP_LAYER_ENTRIES, _MP_INCLUDE_GAPS, _MP_PER_SESSION
+    global _MP_LAYER_ENTRIES, _MP_INCLUDE_GAPS, _MP_PER_SESSION, _MP_COLLECT_PER_SESSION_STATS
     _MP_LAYER_ENTRIES = {lid: entries}
     _MP_INCLUDE_GAPS = include_gaps_local
     _MP_PER_SESSION = per_session_local
+    # For spawn path we always compute per-session stats when caller wants them.
+    _MP_COLLECT_PER_SESSION_STATS = True
     return _mp_worker_compute_layer_overlap(lid)
 
 
@@ -608,6 +613,7 @@ def analyze_adjacent_step_overlap(
     mode: str = "decode",
     include_gaps: bool = False,
     per_session: bool = False,
+    collect_results: bool = False,
 ):
     """分析同一层相邻 step 的重叠率（Jaccard）。
 
@@ -645,9 +651,13 @@ def analyze_adjacent_step_overlap(
     print(f"mode={mode_upper}, include_gaps={include_gaps}")
 
     # Step 1) Build lightweight bucket: layer -> record indices (fast, single pass)
+    # Also compute session context length (max position) using the first layer to avoid duplicates.
     layers_set = set(layers_to_analyze)
     sessions_set = set(target_sessions)
     layer_record_idxs: Dict[int, List[int]] = {lid: [] for lid in layers_to_analyze}
+
+    first_layer_id = layer_ids[0]
+    session_context_len: Dict[int, int] = {}
 
     print("[MP] Building layer->record buckets ...", flush=True)
     for ridx, r in enumerate(records):
@@ -657,6 +667,19 @@ def analyze_adjacent_step_overlap(
         sid = r.get("session_id", 0)
         if sid not in sessions_set:
             continue
+
+        # context length (use first layer only)
+        if lid == first_layer_id:
+            positions = r.get("positions")
+            if positions is not None and positions.numel() > 0:
+                try:
+                    max_pos = int(positions.max().item())
+                    prev = session_context_len.get(int(sid), -1)
+                    if max_pos > prev:
+                        session_context_len[int(sid)] = max_pos
+                except Exception:
+                    pass
+
         fm = str(r.get("forward_mode", "unknown")).upper()
         if mode_upper != "ALL" and fm != mode_upper:
             continue
@@ -673,10 +696,11 @@ def analyze_adjacent_step_overlap(
     print(f"[MP] start_method={start_method}, workers={max_workers}, layers={len(layers_to_analyze)}", flush=True)
 
     if use_fork:
-        global _MP_RECORDS, _MP_INCLUDE_GAPS, _MP_PER_SESSION
+        global _MP_RECORDS, _MP_INCLUDE_GAPS, _MP_PER_SESSION, _MP_COLLECT_PER_SESSION_STATS
         _MP_RECORDS = records
         _MP_INCLUDE_GAPS = include_gaps
         _MP_PER_SESSION = per_session
+        _MP_COLLECT_PER_SESSION_STATS = bool(collect_results)
 
         if max_workers == 1:
             results = [
@@ -739,11 +763,32 @@ def analyze_adjacent_step_overlap(
     # Step 3) Merge + print in stable order
     results_by_layer = {r["layer_id"]: r for r in results}
     any_layer_has_data = False
+
+    collected = {
+        "mode": mode_upper,
+        "include_gaps": include_gaps,
+        "layers": {},  # lid -> {"summary": {...}, "sessions": {sid: {...}}}
+        "session_context_len": session_context_len,
+    }
+
     for lid in sorted(layers_to_analyze):
         r = results_by_layer.get(lid)
         if not r or not r.get("has_data"):
             continue
         any_layer_has_data = True
+
+        # Store results for plotting (and potential downstream uses)
+        sessions_map = {int(s["session_id"]): s for s in r.get("per_session", [])}
+        collected["layers"][int(lid)] = {
+            "summary": {
+                "steps": int(r["steps"]),
+                "mean": float(r["mean"]),
+                "median": float(r["median"]),
+                "min": float(r["min"]),
+                "max": float(r["max"]),
+            },
+            "sessions": sessions_map,
+        }
 
         if per_session:
             for s in sorted(r.get("per_session", []), key=lambda x: x["session_id"]):
@@ -763,17 +808,97 @@ def analyze_adjacent_step_overlap(
         print("没有足够的相邻 step 数据。可以尝试:")
         print("  - 用 --mode all 覆盖 EXTEND+DECODE")
         print("  - 加 --include-gaps 放宽连续性限制")
+        return collected if collect_results else None
+
+    return collected if collect_results else None
+
+
+def plot_adjacent_step_overlap_heatmaps(result: Dict, output_dir: str = "."):
+    """从 analyze_adjacent_step_overlap 的结果画三张热力图：mean / median / min。
+
+    X: layer_id
+    Y: session 的 max context length (max position)
+    Cell: 该 session 在该 layer 上相邻 step overlap 的统计值
+    """
+    try:
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ImportError:
+        print("需要安装 matplotlib 和 numpy: pip install matplotlib numpy")
         return
 
+    if not result or not result.get("layers"):
+        print("没有可绘图的数据（result 为空或没有 layer 结果）")
+        return
 
-def plot_intra_layer_similarity(data: Dict, output_dir: str = "."):
-    """
-    绘制论文风格的 Intra-Layer Similarity 热力图
-    复现 ESS 论文 (arxiv 2512.10576) 的图表风格
+    layers = sorted(result["layers"].keys())
+    ctx = result.get("session_context_len", {})
+    session_ids = sorted(ctx.keys(), key=lambda sid: ctx.get(sid, 0))
+    if not session_ids:
+        # Fallback: take sessions from any layer results
+        sids = set()
+        for lid in layers:
+            sids.update(result["layers"][lid].get("sessions", {}).keys())
+        session_ids = sorted(sids)
 
-    X 轴: Layer IDs
-    Y 轴: Context Length (不同 session 对应不同的 prompt 长度)
-    颜色: Jaccard Similarity (每个 session 在该 layer 的平均相似度)
+    y_labels = [str(ctx.get(sid, sid)) for sid in session_ids]
+
+    mean_mat = np.full((len(session_ids), len(layers)), np.nan, dtype=np.float32)
+    median_mat = np.full((len(session_ids), len(layers)), np.nan, dtype=np.float32)
+    min_mat = np.full((len(session_ids), len(layers)), np.nan, dtype=np.float32)
+
+    for j, lid in enumerate(layers):
+        sessions_map = result["layers"][lid].get("sessions", {})
+        for i, sid in enumerate(session_ids):
+            s = sessions_map.get(int(sid))
+            if not s:
+                continue
+            mean_mat[i, j] = float(s.get("mean", np.nan))
+            median_mat[i, j] = float(s.get("median", np.nan))
+            min_mat[i, j] = float(s.get("min", np.nan))
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    def _plot_one(mat, metric_name: str, file_name: str):
+        fig, ax = plt.subplots(figsize=(max(10, len(layers) * 0.45), max(4, len(session_ids) * 0.45)))
+        im = ax.imshow(mat, aspect="auto", cmap="YlGnBu", vmin=0.0, vmax=1.0, interpolation="nearest")
+        ax.set_xlabel("Layer ID")
+        ax.set_ylabel("Context Length (session max position)")
+        ax.set_title(f"Adjacent-step overlap ({metric_name}) | mode={result.get('mode')} | include_gaps={result.get('include_gaps')}")
+
+        ax.set_xticks(range(len(layers)))
+        ax.set_xticklabels(layers)
+        ax.set_yticks(range(len(session_ids)))
+        ax.set_yticklabels(y_labels)
+
+        plt.colorbar(im, ax=ax, label=metric_name)
+        plt.tight_layout()
+        out = output_dir / file_name
+        plt.savefig(out, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"图表已保存到: {out}")
+
+    base = f"adjacent_step_overlap_mode{str(result.get('mode', 'NA')).lower()}" + ("_gaps" if result.get("include_gaps") else "")
+    _plot_one(mean_mat, "mean", f"{base}_mean.png")
+    _plot_one(median_mat, "median", f"{base}_median.png")
+    _plot_one(min_mat, "min", f"{base}_min.png")
+
+
+def plot_adjacent_step_overlap(
+    data: Dict,
+    output_dir: str = ".",
+    layer_id: Optional[int] = None,
+    session_id: Optional[int] = None,
+    mode: str = "decode",
+    include_gaps: bool = False,
+):
+    """绘制“同一层相邻 step 重叠率”热力图（按 session 分行）。
+
+    - X 轴: layer_id
+    - Y 轴: session 的上下文长度（该 session 的最大 position）
+    - 格子值: 该 (session, layer) 下相邻 step overlap 的统计量
+    - 输出三张图: mean / median / min
     """
     try:
         import matplotlib.pyplot as plt
@@ -783,238 +908,161 @@ def plot_intra_layer_similarity(data: Dict, output_dir: str = "."):
         return
 
     records = data.get("records", [])
-    layer_ids = get_layer_ids(data)
+    all_layer_ids = get_layer_ids(data)
+    if not all_layer_ids:
+        print("没有找到任何 layer 记录")
+        return
+
+    layers_to_plot = [layer_id] if layer_id is not None else all_layer_ids
+
+    mode_upper = mode.upper()
+    if mode_upper not in ("DECODE", "EXTEND", "ALL"):
+        raise ValueError(f"Invalid mode: {mode}")
+
     session_ids = get_session_ids(data)
+    if session_id is not None:
+        if session_id not in session_ids:
+            print(f"错误: session_id={session_id} 不存在，可用的 session IDs: {session_ids}")
+            return
+        target_sessions = [session_id]
+    else:
+        target_sessions = session_ids
+
     output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 60)
-    print("绘制 Intra-Layer Similarity 热力图 (论文风格)")
+    print("绘制 同层相邻 step 重叠率热力图 (按 session 分行)")
     print("=" * 60)
+    print(f"layers={len(layers_to_plot)} (example: {layers_to_plot[0]}..{layers_to_plot[-1]}), mode={mode_upper}, include_gaps={include_gaps}")
 
-    # 为每个 session 的每层计算平均 Jaccard 相似度
-    # 结构: {session_id: {layer_id: mean_similarity}}
-    session_layer_similarity = {sid: {} for sid in session_ids}
+    layers_set = set(layers_to_plot)
+    sessions_set = set(target_sessions)
 
-    # 同时记录每个 session 的 context length (用于 Y 轴标签)
-    session_context_len = {}
+    # 预处理：
+    # 1) session_context_len: 每个 session 的最大 position
+    # 2) (sid, lid) -> record indices (避免后面重复扫全量 records)
+    session_context_len: Dict[int, int] = {sid: 0 for sid in target_sessions}
+    sl_record_idxs: Dict[tuple, List[int]] = defaultdict(list)
 
-    for session_id in session_ids:
-        for layer_id in layer_ids:
-            # 获取该 session 该 layer 的所有记录 (EXTEND + DECODE)
-            layer_records = [r for r in records
-                              if r.get("layer_id") == layer_id
-                              and r.get("session_id", 0) == session_id]
-
-            if not layer_records:
-                continue
-
-            # 收集所有 (position, indices) 对，然后按 position 排序
-            pos_indices_list = []  # [(pos, indices_set), ...]
-
-            for record in layer_records:
-                indices = record.get("topk_indices")
-                positions = record.get("positions")
-
-                if indices is None or positions is None:
-                    continue
-
-                # EXTEND: 多个 position; DECODE: 单个 position
-                for i in range(positions.shape[0]):
-                    pos = positions[i].item()
-                    idx_set = set(indices[i].tolist())
-                    pos_indices_list.append((pos, idx_set))
-
-            # 按 position 排序
-            pos_indices_list.sort(key=lambda x: x[0])
-
-            if len(pos_indices_list) < 2:
-                continue
-
-            # 计算相邻 position 的 Jaccard 相似度
-            similarities = []
-            max_pos = 0
-
-            for i in range(1, len(pos_indices_list)):
-                prev_pos, prev_indices = pos_indices_list[i - 1]
-                curr_pos, curr_indices = pos_indices_list[i]
-                max_pos = max(max_pos, curr_pos)
-
-                if prev_indices or curr_indices:
-                    jaccard = len(prev_indices & curr_indices) / len(prev_indices | curr_indices)
-                else:
-                    jaccard = 1.0
-                similarities.append(jaccard)
-
-            if similarities:
-                session_layer_similarity[session_id][layer_id] = np.mean(similarities)
-                session_context_len[session_id] = max_pos
-
-    # 过滤掉没有数据的 session
-    valid_sessions = [sid for sid in session_ids if session_layer_similarity[sid]]
-    if not valid_sessions:
-        print("没有足够的数据 (需要至少 2 个 position)")
-        return
-
-    # 按 context length 排序 session
-    valid_sessions = sorted(valid_sessions, key=lambda s: session_context_len.get(s, 0))
-
-    print(f"有效 Session 数: {len(valid_sessions)}")
-    print(f"Layer 数量: {len(layer_ids)}")
-    for sid in valid_sessions:
-        ctx_len = session_context_len.get(sid, 0)
-        print(f"  Session {sid}: Context Length ≈ {ctx_len}")
-
-    # 构建热力图矩阵
-    # 行: session (context length), 列: layer id
-    heatmap_data = np.zeros((len(valid_sessions), len(layer_ids)))
-
-    for i, sid in enumerate(valid_sessions):
-        for j, lid in enumerate(layer_ids):
-            heatmap_data[i, j] = session_layer_similarity[sid].get(lid, np.nan)
-
-    # ==================== 绘制热力图 ====================
-    fig, ax = plt.subplots(figsize=(max(12, len(layer_ids) * 0.5), max(4, len(valid_sessions) * 0.5)))
-
-    im = ax.imshow(heatmap_data, aspect='auto', cmap='YlGnBu',
-                   vmin=0, vmax=1, interpolation='nearest')
-
-    # 设置坐标轴
-    ax.set_xlabel("Layer IDs", fontsize=12)
-    ax.set_ylabel("Context Length", fontsize=12)
-    ax.set_title("Intra-Layer Similarity Across Different Context Lengths", fontsize=14)
-
-    # X 轴: Layer IDs
-    ax.set_xticks(range(len(layer_ids)))
-    ax.set_xticklabels(layer_ids)
-
-    # Y 轴: Context Length (来自 session)
-    ax.set_yticks(range(len(valid_sessions)))
-    y_labels = [str(session_context_len.get(sid, f"S{sid}")) for sid in valid_sessions]
-    ax.set_yticklabels(y_labels)
-
-    # 添加 colorbar
-    cbar = plt.colorbar(im, ax=ax, label="Similarity")
-
-    plt.tight_layout()
-    output_file = output_dir / "intra_layer_similarity.png"
-    plt.savefig(output_file, dpi=150, bbox_inches='tight')
-    print(f"热力图已保存到: {output_file}")
-    plt.close()
-
-    # ==================== 打印统计信息 ====================
-    print("\n各层平均相似度 (跨所有 context length):")
-    for j, lid in enumerate(layer_ids):
-        col_data = heatmap_data[:, j]
-        valid_data = col_data[~np.isnan(col_data)]
-        if len(valid_data) > 0:
-            print(f"  Layer {lid}: {np.mean(valid_data):.1%}")
-
-
-def plot_decode_stability(data: Dict, output_dir: str = "."):
-    """绘制多层 Decode 稳定性图 (Jaccard 重叠度)"""
-    try:
-        import matplotlib.pyplot as plt
-        import numpy as np
-    except ImportError:
-        print("需要安装 matplotlib: pip install matplotlib")
-        return
-
-    records = data.get("records", [])
-    layer_ids = get_layer_ids(data)
-    output_dir = Path(output_dir)
-
-    print("=" * 60)
-    print("绘制 Decode 稳定性图 (多层叠加)")
-    print("=" * 60)
-
-    # 为每层计算 decode 稳定性
-    layer_data = {}  # layer_id -> {"positions": [...], "overlaps": [...]}
-
-    for layer_id in layer_ids:
-        # 获取该层的 DECODE 记录，按 position 排序
-        decode_records = [r for r in records
-                          if r.get("forward_mode") == "DECODE" and r.get("layer_id") == layer_id]
-        decode_records = sorted(decode_records,
-                                 key=lambda r: r.get("positions", torch.tensor([0]))[0].item())
-
-        if len(decode_records) < 2:
+    for ridx, r in enumerate(records):
+        lid = r.get("layer_id")
+        if lid not in layers_set:
+            continue
+        sid = int(r.get("session_id", 0))
+        if sid not in sessions_set:
             continue
 
-        positions = []
-        overlaps = []
-        prev_indices = None
+        fm = str(r.get("forward_mode", "unknown")).upper()
+        if mode_upper != "ALL" and fm != mode_upper:
+            continue
 
-        for record in decode_records:
-            indices = record.get("topk_indices")
-            pos = record.get("positions")
+        positions = r.get("positions")
+        indices = r.get("topk_indices")
+        if positions is None or indices is None:
+            continue
 
-            if indices is not None and pos is not None and indices.shape[0] == 1:
-                curr_indices = set(indices[0].tolist())
-                curr_pos = pos[0].item()
+        # 记录 idx
+        sl_record_idxs[(sid, lid)].append(ridx)
 
-                if prev_indices is not None:
-                    # 计算 Jaccard 相似度
-                    if prev_indices or curr_indices:
-                        jaccard = len(prev_indices & curr_indices) / len(prev_indices | curr_indices)
-                    else:
-                        jaccard = 1.0
-                    positions.append(curr_pos)
-                    overlaps.append(jaccard)
+        # 更新上下文长度（max position）
+        try:
+            max_pos = int(positions.max().item())
+            if max_pos > session_context_len.get(sid, 0):
+                session_context_len[sid] = max_pos
+        except Exception:
+            # positions 可能为空/异常，忽略
+            pass
 
-                prev_indices = curr_indices
-
-        if positions:
-            layer_data[layer_id] = {"positions": positions, "overlaps": overlaps}
-
-    if not layer_data:
-        print("没有足够的 DECODE 数据")
+    # 过滤掉没有任何数据的 session
+    valid_sessions = [sid for sid in target_sessions if session_context_len.get(sid, 0) > 0 or any((sid, lid) in sl_record_idxs for lid in layers_to_plot)]
+    if not valid_sessions:
+        print("没有足够的数据绘图（没有找到满足条件的 session/layer 记录）")
         return
 
-    # 绘图
-    fig, ax = plt.subplots(figsize=(14, 6))
+    # 按上下文长度排序 session（Y 轴）
+    valid_sessions = sorted(valid_sessions, key=lambda s: session_context_len.get(s, 0))
 
-    # 使用不同颜色绘制每层
-    colors = plt.cm.tab10(np.linspace(0, 1, len(layer_ids)))
+    # heatmaps: rows=session, cols=layer
+    h_mean = np.full((len(valid_sessions), len(layers_to_plot)), np.nan, dtype=np.float32)
+    h_median = np.full_like(h_mean, np.nan)
+    h_min = np.full_like(h_mean, np.nan)
 
-    for idx, layer_id in enumerate(sorted(layer_data.keys())):
-        data_layer = layer_data[layer_id]
-        positions = data_layer["positions"]
-        overlaps = data_layer["overlaps"]
+    for i, sid in enumerate(valid_sessions):
+        for j, lid in enumerate(layers_to_plot):
+            rec_idxs = sl_record_idxs.get((sid, lid), [])
+            if not rec_idxs:
+                continue
 
-        ax.plot(positions, overlaps,
-                label=f"Layer {layer_id}",
-                color=colors[idx],
-                alpha=0.7,
-                linewidth=1.5)
+            # pos -> indices_row (同 pos 取最后一次)
+            pos_to_row: Dict[int, torch.Tensor] = {}
+            for ridx in rec_idxs:
+                r = records[ridx]
+                positions = r.get("positions")
+                indices = r.get("topk_indices")
+                if positions is None or indices is None:
+                    continue
+                for k in range(int(positions.shape[0])):
+                    pos = int(positions[k].item())
+                    pos_to_row[pos] = indices[k]
 
-    ax.set_xlabel("Query Position (Decode Step)", fontsize=12)
-    ax.set_ylabel("Jaccard Similarity with Previous Step", fontsize=12)
-    ax.set_title("Decode Stability: Consecutive Step Overlap (All Layers)", fontsize=14)
-    ax.set_ylim(0, 1.05)
-    ax.legend(loc="lower right", fontsize=9)
-    ax.grid(True, alpha=0.3)
+            if len(pos_to_row) < 2:
+                continue
 
-    # 添加平均线
-    all_overlaps = []
-    for layer_id in layer_data:
-        all_overlaps.extend(layer_data[layer_id]["overlaps"])
-    if all_overlaps:
-        avg = np.mean(all_overlaps)
-        ax.axhline(y=avg, color='red', linestyle='--', alpha=0.5, label=f'Overall Mean: {avg:.1%}')
-        # 更新图例
-        ax.legend(loc="lower right", fontsize=9)
+            sorted_pos = sorted(pos_to_row.keys())
+            overlaps: List[float] = []
+            prev_pos = sorted_pos[0]
+            prev_set = set(int(x) for x in pos_to_row[prev_pos].tolist())
+            for curr_pos in sorted_pos[1:]:
+                curr_set = set(int(x) for x in pos_to_row[curr_pos].tolist())
+                delta = curr_pos - prev_pos
+                if delta <= 0:
+                    prev_pos, prev_set = curr_pos, curr_set
+                    continue
+                if (not include_gaps) and delta != 1:
+                    prev_pos, prev_set = curr_pos, curr_set
+                    continue
+                denom = len(prev_set | curr_set)
+                jaccard = (len(prev_set & curr_set) / denom) if denom else 1.0
+                overlaps.append(jaccard)
+                prev_pos, prev_set = curr_pos, curr_set
 
-    plt.tight_layout()
-    output_file = output_dir / "decode_stability.png"
-    plt.savefig(output_file, dpi=150)
-    print(f"图表已保存到: {output_file}")
-    plt.close()
+            if not overlaps:
+                continue
 
-    # 打印统计信息
-    print("\n各层统计:")
-    for layer_id in sorted(layer_data.keys()):
-        overlaps = layer_data[layer_id]["overlaps"]
-        print(f"  Layer {layer_id}: mean={np.mean(overlaps):.1%}, std={np.std(overlaps):.1%}, n={len(overlaps)}")
+            t = torch.tensor(overlaps, dtype=torch.float)
+            h_mean[i, j] = float(t.mean().item())
+            h_median[i, j] = float(t.median().item())
+            h_min[i, j] = float(t.min().item())
+
+    y_labels = [str(session_context_len.get(sid, 0)) for sid in valid_sessions]
+
+    def _plot_heatmap(values: "np.ndarray", title: str, out_name: str):
+        fig, ax = plt.subplots(figsize=(max(10, len(layers_to_plot) * 0.45), max(4, len(valid_sessions) * 0.45)))
+        im = ax.imshow(values, aspect="auto", vmin=0, vmax=1, interpolation="nearest", cmap="YlGnBu")
+        ax.set_xlabel("Layer ID")
+        ax.set_ylabel("Context Length (max position per session)")
+        ax.set_title(title)
+        ax.set_xticks(range(len(layers_to_plot)))
+        ax.set_xticklabels(layers_to_plot)
+        ax.set_yticks(range(len(valid_sessions)))
+        ax.set_yticklabels(y_labels)
+        plt.colorbar(im, ax=ax, label="Adjacent-step overlap")
+        plt.tight_layout()
+        out_file = output_dir / out_name
+        plt.savefig(out_file, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"图表已保存到: {out_file}")
+
+    suffix = f"mode_{mode.lower()}" + ("_gaps" if include_gaps else "")
+    if layer_id is not None:
+        suffix += f"_layer{layer_id}"
+    if session_id is not None:
+        suffix += f"_session{session_id}"
+
+    _plot_heatmap(h_mean, f"Adjacent-step overlap (mean) | {suffix}", f"adjacent_step_overlap_mean_{suffix}.png")
+    _plot_heatmap(h_median, f"Adjacent-step overlap (median) | {suffix}", f"adjacent_step_overlap_median_{suffix}.png")
+    _plot_heatmap(h_min, f"Adjacent-step overlap (min) | {suffix}", f"adjacent_step_overlap_min_{suffix}.png")
 
 
 def main():
@@ -1071,13 +1119,14 @@ def main():
         print_records(data, args.records)
 
     # 我们关心的核心指标：同一层相邻 step 重叠率（cache 潜力）
-    analyze_adjacent_step_overlap(
+    analysis_result = analyze_adjacent_step_overlap(
         data,
         layer_id=args.layer,
         session_id=args.session,
         mode=args.mode,
         include_gaps=args.include_gaps,
         per_session=not args.no_per_session,
+        collect_results=args.plot,
     )
 
     # # 距离分析
@@ -1091,8 +1140,7 @@ def main():
 
     # 生成图表
     if args.plot:
-        plot_decode_stability(data, args.output)
-        plot_intra_layer_similarity(data, args.output)
+        plot_adjacent_step_overlap_heatmaps(analysis_result, output_dir=args.output)
 
 
 if __name__ == "__main__":
