@@ -9,11 +9,205 @@ TopK Locality 数据分析脚本
 """
 
 import argparse
+import os
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional
 from collections import defaultdict
 
 import torch
+
+
+# For multiprocessing workers (fork-friendly): parent fills this mapping and workers read it.
+_MP_LAYER_ENTRIES = None
+_MP_INCLUDE_GAPS = False
+_MP_PER_SESSION = False
+_MP_RECORDS = None
+
+
+def _mp_worker_compute_layer_overlap_from_record_idxs(packed_args):
+    """Worker (fork path): compute one layer from record indices.
+
+    packed_args: (layer_id, record_indices)
+    Uses global _MP_RECORDS inherited via fork.
+    """
+    layer_id, record_indices = packed_args
+    records = _MP_RECORDS
+    include_gaps = _MP_INCLUDE_GAPS
+    per_session = _MP_PER_SESSION
+
+    if records is None or not record_indices:
+        return {"layer_id": layer_id, "steps": 0, "has_data": False, "per_session": []}
+
+    # Build: session -> {pos: indices_tensor_row}
+    session_pos_to_row: Dict[int, Dict[int, torch.Tensor]] = defaultdict(dict)
+    for ridx in record_indices:
+        r = records[ridx]
+        positions = r.get("positions")
+        indices = r.get("topk_indices")
+        if positions is None or indices is None:
+            continue
+        sid = int(r.get("session_id", 0))
+
+        for i in range(int(positions.shape[0])):
+            pos = int(positions[i].item())
+            # If the same pos appears multiple times, keep the last one.
+            session_pos_to_row[sid][pos] = indices[i]
+
+    layer_overlaps: List[float] = []
+    per_session_stats = []
+
+    for sid, pos_to_row in session_pos_to_row.items():
+        if len(pos_to_row) < 2:
+            continue
+
+        sorted_pos = sorted(pos_to_row.keys())
+        overlaps: List[float] = []
+
+        prev_pos = sorted_pos[0]
+        prev_set = set(int(x) for x in pos_to_row[prev_pos].tolist())
+
+        for curr_pos in sorted_pos[1:]:
+            curr_set = set(int(x) for x in pos_to_row[curr_pos].tolist())
+            delta = curr_pos - prev_pos
+            if delta <= 0:
+                prev_pos, prev_set = curr_pos, curr_set
+                continue
+            if (not include_gaps) and delta != 1:
+                prev_pos, prev_set = curr_pos, curr_set
+                continue
+
+            denom = len(prev_set | curr_set)
+            jaccard = (len(prev_set & curr_set) / denom) if denom else 1.0
+            overlaps.append(jaccard)
+            layer_overlaps.append(jaccard)
+            prev_pos, prev_set = curr_pos, curr_set
+
+        if per_session and overlaps:
+            t = torch.tensor(overlaps, dtype=torch.float)
+            per_session_stats.append(
+                {
+                    "session_id": sid,
+                    "steps": len(overlaps),
+                    "mean": float(t.mean().item()),
+                    "median": float(t.median().item()),
+                    "min": float(t.min().item()),
+                    "max": float(t.max().item()),
+                }
+            )
+
+    if not layer_overlaps:
+        return {"layer_id": layer_id, "steps": 0, "has_data": False, "per_session": per_session_stats}
+
+    t_layer = torch.tensor(layer_overlaps, dtype=torch.float)
+    return {
+        "layer_id": layer_id,
+        "steps": len(layer_overlaps),
+        "has_data": True,
+        "mean": float(t_layer.mean().item()),
+        "median": float(t_layer.median().item()),
+        "min": float(t_layer.min().item()),
+        "max": float(t_layer.max().item()),
+        "per_session": per_session_stats,
+    }
+
+
+def _mp_worker_compute_layer_overlap(layer_id: int):
+    """Worker: compute adjacent-step overlap stats for one layer.
+
+    Reads shared globals populated in the parent process.
+    Returns a dict with per-layer summary and optional per-session summaries.
+    """
+    layer_entries = _MP_LAYER_ENTRIES.get(layer_id, []) if _MP_LAYER_ENTRIES is not None else []
+    include_gaps = _MP_INCLUDE_GAPS
+    per_session = _MP_PER_SESSION
+
+    # entries: list[(session_id, position, tuple[int,...])]
+    if len(layer_entries) < 2:
+        return {"layer_id": layer_id, "steps": 0, "has_data": False, "per_session": []}
+
+    layer_entries = sorted(layer_entries, key=lambda x: (x[0], x[1]))
+
+    layer_overlaps: List[float] = []
+    per_session_stats = []
+
+    prev_sid = None
+    prev_pos = None
+    prev_tuple = None
+    current_overlaps: List[float] = []
+
+    def _flush_session(sid: int, overlaps: List[float]):
+        if not overlaps:
+            return
+        t = torch.tensor(overlaps, dtype=torch.float)
+        per_session_stats.append(
+            {
+                "session_id": sid,
+                "steps": len(overlaps),
+                "mean": float(t.mean().item()),
+                "median": float(t.median().item()),
+                "min": float(t.min().item()),
+                "max": float(t.max().item()),
+            }
+        )
+
+    for sid, pos, idx_tuple in layer_entries:
+        if prev_sid is None:
+            prev_sid, prev_pos, prev_tuple = sid, pos, idx_tuple
+            continue
+
+        if sid != prev_sid:
+            if per_session:
+                _flush_session(prev_sid, current_overlaps)
+            current_overlaps = []
+            prev_sid, prev_pos, prev_tuple = sid, pos, idx_tuple
+            continue
+
+        delta = pos - prev_pos
+        if delta <= 0:
+            prev_pos, prev_tuple = pos, idx_tuple
+            continue
+        if (not include_gaps) and delta != 1:
+            prev_pos, prev_tuple = pos, idx_tuple
+            continue
+
+        prev_set = set(prev_tuple)
+        curr_set = set(idx_tuple)
+        denom = len(prev_set | curr_set)
+        jaccard = (len(prev_set & curr_set) / denom) if denom else 1.0
+        current_overlaps.append(jaccard)
+        layer_overlaps.append(jaccard)
+
+        prev_pos, prev_tuple = pos, idx_tuple
+
+    if per_session:
+        _flush_session(prev_sid, current_overlaps)
+
+    if not layer_overlaps:
+        return {"layer_id": layer_id, "steps": 0, "has_data": False, "per_session": per_session_stats}
+
+    t_layer = torch.tensor(layer_overlaps, dtype=torch.float)
+    return {
+        "layer_id": layer_id,
+        "steps": len(layer_overlaps),
+        "has_data": True,
+        "mean": float(t_layer.mean().item()),
+        "median": float(t_layer.median().item()),
+        "min": float(t_layer.min().item()),
+        "max": float(t_layer.max().item()),
+        "per_session": per_session_stats,
+    }
+
+
+def _spawn_worker_compute_layer_overlap(packed_args):
+    """Picklable wrapper for non-fork start methods (spawn/forkserver)."""
+    lid, entries, include_gaps_local, per_session_local = packed_args
+    global _MP_LAYER_ENTRIES, _MP_INCLUDE_GAPS, _MP_PER_SESSION
+    _MP_LAYER_ENTRIES = {lid: entries}
+    _MP_INCLUDE_GAPS = include_gaps_local
+    _MP_PER_SESSION = per_session_local
+    return _mp_worker_compute_layer_overlap(lid)
 
 
 def load_data(file_path: str) -> Dict:
@@ -450,77 +644,120 @@ def analyze_adjacent_step_overlap(
     print("=" * 60)
     print(f"mode={mode_upper}, include_gaps={include_gaps}")
 
-    any_layer_has_data = False
+    # Step 1) Build lightweight bucket: layer -> record indices (fast, single pass)
+    layers_set = set(layers_to_analyze)
+    sessions_set = set(target_sessions)
+    layer_record_idxs: Dict[int, List[int]] = {lid: [] for lid in layers_to_analyze}
 
-    for lid in layers_to_analyze:
-        layer_overlaps: List[float] = []
-
-        for sid in target_sessions:
-            # 收集 (pos -> indices_set)，同时兼容 EXTEND(多pos) 和 DECODE(单pos)
-            pos_to_indices: Dict[int, set] = {}
-            for r in records:
-                if r.get("layer_id") != lid:
-                    continue
-                if r.get("session_id", 0) != sid:
-                    continue
-
-                fm = str(r.get("forward_mode", "unknown")).upper()
-                if mode_upper != "ALL" and fm != mode_upper:
-                    continue
-
-                positions = r.get("positions")
-                indices = r.get("topk_indices")
-                if positions is None or indices is None:
-                    continue
-
-                for i in range(int(positions.shape[0])):
-                    pos = int(positions[i].item())
-                    pos_to_indices[pos] = set(int(x) for x in indices[i].tolist())
-
-            if len(pos_to_indices) < 2:
-                continue
-
-            sorted_pos = sorted(pos_to_indices.keys())
-            overlaps: List[float] = []
-
-            prev_pos = sorted_pos[0]
-            prev_set = pos_to_indices[prev_pos]
-            for curr_pos in sorted_pos[1:]:
-                curr_set = pos_to_indices[curr_pos]
-                delta = curr_pos - prev_pos
-                if delta <= 0:
-                    prev_pos, prev_set = curr_pos, curr_set
-                    continue
-                if (not include_gaps) and delta != 1:
-                    prev_pos, prev_set = curr_pos, curr_set
-                    continue
-
-                denom = len(prev_set | curr_set)
-                jaccard = (len(prev_set & curr_set) / denom) if denom else 1.0
-                overlaps.append(jaccard)
-                prev_pos, prev_set = curr_pos, curr_set
-
-            if not overlaps:
-                continue
-
-            if per_session:
-                t = torch.tensor(overlaps, dtype=torch.float)
-                print(
-                    f"Layer {lid} | Session {sid}: steps={len(overlaps)} | mean={t.mean().item():.1%} | "
-                    f"median={t.median().item():.1%} | min={t.min().item():.1%} | max={t.max().item():.1%}"
-                ,flush=True)
-
-            layer_overlaps.extend(overlaps)
-
-        if not layer_overlaps:
+    print("[MP] Building layer->record buckets ...", flush=True)
+    for ridx, r in enumerate(records):
+        lid = r.get("layer_id")
+        if lid not in layers_set:
             continue
+        sid = r.get("session_id", 0)
+        if sid not in sessions_set:
+            continue
+        fm = str(r.get("forward_mode", "unknown")).upper()
+        if mode_upper != "ALL" and fm != mode_upper:
+            continue
+        # Keep record idx; worker will expand positions/indices.
+        layer_record_idxs[lid].append(ridx)
 
+    # Step 2) Parallel per-layer computation
+    results = []
+    start_method = mp.get_start_method()
+    use_fork = start_method == "fork"
+
+    # User asked: one process per layer.
+    max_workers = max(1, len(layers_to_analyze))
+    print(f"[MP] start_method={start_method}, workers={max_workers}, layers={len(layers_to_analyze)}", flush=True)
+
+    if use_fork:
+        global _MP_RECORDS, _MP_INCLUDE_GAPS, _MP_PER_SESSION
+        _MP_RECORDS = records
+        _MP_INCLUDE_GAPS = include_gaps
+        _MP_PER_SESSION = per_session
+
+        if max_workers == 1:
+            results = [
+                _mp_worker_compute_layer_overlap_from_record_idxs((lid, layer_record_idxs.get(lid, [])))
+                for lid in layers_to_analyze
+            ]
+        else:
+            ctx = mp.get_context("fork")
+            with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as ex:
+                futures = {
+                    ex.submit(
+                        _mp_worker_compute_layer_overlap_from_record_idxs,
+                        (lid, layer_record_idxs.get(lid, [])),
+                    ): lid
+                    for lid in layers_to_analyze
+                }
+                total = len(futures)
+                done = 0
+                report_every = max(1, total // 10)
+                for fut in as_completed(futures):
+                    results.append(fut.result())
+                    done += 1
+                    if done % report_every == 0 or done == total:
+                        print(f"[MP] done {done}/{total} layers", flush=True)
+    else:
+        # spawn/forkserver: fallback to the previous "pre-extract layer entries" approach.
+        print("[MP] Non-fork start method detected; pre-extracting entries for spawn ...", flush=True)
+        layer_entries: Dict[int, List] = {lid: [] for lid in layers_to_analyze}
+        for r in records:
+            lid = r.get("layer_id")
+            if lid not in layers_set:
+                continue
+            sid = r.get("session_id", 0)
+            if sid not in sessions_set:
+                continue
+            fm = str(r.get("forward_mode", "unknown")).upper()
+            if mode_upper != "ALL" and fm != mode_upper:
+                continue
+            positions = r.get("positions")
+            indices = r.get("topk_indices")
+            if positions is None or indices is None:
+                continue
+            for i in range(int(positions.shape[0])):
+                pos = int(positions[i].item())
+                idx_tuple = tuple(int(x) for x in indices[i].tolist())
+                layer_entries[lid].append((sid, pos, idx_tuple))
+
+        ctx = mp.get_context(start_method)
+        with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as ex:
+            packed = [(lid, layer_entries[lid], include_gaps, per_session) for lid in layers_to_analyze]
+            total = len(packed)
+            done = 0
+            report_every = max(1, total // 10)
+            for res in ex.map(_spawn_worker_compute_layer_overlap, packed):
+                results.append(res)
+                done += 1
+                if done % report_every == 0 or done == total:
+                    print(f"[MP] done {done}/{total} layers", flush=True)
+
+    # Step 3) Merge + print in stable order
+    results_by_layer = {r["layer_id"]: r for r in results}
+    any_layer_has_data = False
+    for lid in sorted(layers_to_analyze):
+        r = results_by_layer.get(lid)
+        if not r or not r.get("has_data"):
+            continue
         any_layer_has_data = True
-        t_layer = torch.tensor(layer_overlaps, dtype=torch.float)
+
+        if per_session:
+            for s in sorted(r.get("per_session", []), key=lambda x: x["session_id"]):
+                print(
+                    f"Layer {lid} | Session {s['session_id']}: steps={s['steps']} | mean={s['mean']:.1%} | "
+                    f"median={s['median']:.1%} | min={s['min']:.1%} | max={s['max']:.1%}",
+                    flush=True,
+                )
+
         print(
-            f"Layer {lid}: steps={len(layer_overlaps)} | mean={t_layer.mean().item():.1%} | "
-            f"median={t_layer.median().item():.1%} | min={t_layer.min().item():.1%} | max={t_layer.max().item():.1%}"
-        ,flush=True)
+            f"Layer {lid}: steps={r['steps']} | mean={r['mean']:.1%} | "
+            f"median={r['median']:.1%} | min={r['min']:.1%} | max={r['max']:.1%}",
+            flush=True,
+        )
 
     if not any_layer_has_data:
         print("没有足够的相邻 step 数据。可以尝试:")
