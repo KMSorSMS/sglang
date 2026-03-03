@@ -18,6 +18,7 @@ TopK Indices Collector for NSA (Native Sparse Attention)
 from __future__ import annotations
 
 import os
+import atexit
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional
@@ -65,12 +66,14 @@ class TopKLocalityCollector:
     """
 
     _instance: Optional["TopKLocalityCollector"] = None
+    _atexit_handler_installed: bool = False
 
     def __init__(self):
         self.enabled = os.getenv("NSA_COLLECT_TOPK", "1") == "1"
         self.save_path = Path(os.getenv("NSA_TOPK_SAVE_PATH", "./topk_locality_data"))
-        self.max_records = int(os.getenv("NSA_MAX_RECORDS", "10000"))
+        self.max_records = int(os.getenv("NSA_MAX_RECORDS", "100000"))
         self.save_interval = int(os.getenv("NSA_SAVE_INTERVAL", "500"))
+        self.save_on_exit = os.getenv("NSA_SAVE_ON_EXIT", "1") == "1"
         self.log_to_file = os.getenv("NSA_LOG_TO_FILE", "1") == "1"  # 是否输出可读日志
         print(f"[TopKCollector] Initializing TopKLocalityCollector...")
 
@@ -89,24 +92,52 @@ class TopKLocalityCollector:
 
         # 可读日志文件
         self.log_file = None
+        self._log_path: Optional[Path] = None
+        self._printed_log_path = False
         if self.enabled:
             self.save_path.mkdir(parents=True, exist_ok=True)
             print(f"[TopKCollector] Enabled, saving to {self.save_path}")
             print(f"[TopKCollector] Max records: {self.max_records}, save interval: {self.save_interval}")
+
+            if self.save_on_exit:
+                self._install_atexit_handler()
+
             if self.log_to_file:
-                log_path = self.save_path / "topk_readable.log"
-                self.log_file = open(log_path, "a")  # 追加模式
-                # 写入分隔符，区分不同运行
-                from datetime import datetime
-                self.log_file.write(f"\n{'='*60}\n")
-                self.log_file.write(f"New session: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                self.log_file.write(f"{'='*60}\n")
-                self.log_file.flush()
-                print(f"[TopKCollector] Readable log (append): {log_path}")
+                # 只在 init 打开文件，不写 banner/不打印；真正开始记录时再输出提示。
+                self._log_path = self.save_path / "topk_readable.log"
+                self.log_file = open(self._log_path, "a")  # 追加模式
+
+    def _write_readable_log_banner(self, session_id: int):
+        if self.log_file is None:
+            return
+        from datetime import datetime
+
+        self.log_file.write(f"\n{'='*60}\n")
+        self.log_file.write(
+            f"New session: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | session_id={session_id}\n"
+        )
+        self.log_file.write(f"{'='*60}\n")
+        self.log_file.flush()
+
+    def _install_atexit_handler(self):
+        if TopKLocalityCollector._atexit_handler_installed:
+            return
+
+        def _on_exit():
+            try:
+                if self.enabled and len(self.records) > 0:
+                    print(f"[TopKCollector] Process exiting, saving {len(self.records)} pending records...")
+                    self.save()
+            except Exception as e:
+                print(f"[TopKCollector] Save-on-exit failed: {e}")
+
+        atexit.register(_on_exit)
+        TopKLocalityCollector._atexit_handler_installed = True
 
     @classmethod
     def get_instance(cls) -> "TopKLocalityCollector":
         if cls._instance is None:
+            print(f"[TopKCollector] Creating new instance of TopKLocalityCollector...")
             cls._instance = cls()
         return cls._instance
 
@@ -137,23 +168,30 @@ class TopKLocalityCollector:
 
         # 检测新 session: 当从 DECODE 切换到 EXTEND，或首次 EXTEND 时
         # 只在 layer_id=0 时检测，避免同一个 prefill 的多层重复触发
-        if layer_id == 0 and mode_name == "EXTEND":
+        if layer_id == 0 and (mode_name == "EXTEND" or self._last_mode is None):
             if self._last_mode != "EXTEND":
                 self.current_session_id += 1
                 self.total_sessions += 1
-                print(f"[TopKCollector] New session started: session_id={self.current_session_id}")
+                print(f"[TopKCollector] New session started: session_id={self.current_session_id}", flush=True)
+
+                # 在真正开始记录时再提示可读日志路径，并写入 session 分隔 banner。
+                if self.log_file is not None:
+                    if (not self._printed_log_path) and (self._log_path is not None):
+                        print(f"[TopKCollector] Readable log (append): {self._log_path}", flush=True)
+                        self._printed_log_path = True
+                    self._write_readable_log_banner(self.current_session_id)
         if layer_id == 0:
             self._last_mode = mode_name
 
         # DEBUG: 打印调用信息
-        print(f"[TopKCollector DEBUG] record(): session={self.current_session_id}, layer={layer_id}, mode={mode_name}, seq_len={seq_len}, num_tokens={positions.shape[0]}, total={self.total_records}")
+        # print(f"[TopKCollector DEBUG] record(): session={self.current_session_id}, layer={layer_id}, mode={mode_name}, seq_len={seq_len}, num_tokens={positions.shape[0]}, total={self.total_records}")
 
         if not self.enabled:
             return
 
         if self.total_records >= self.max_records:
             if self.total_records == self.max_records:
-                print(f"[TopKCollector] Reached max records {self.max_records}, saving and stopping...")
+                print(f"[TopKCollector] Reached max records {self.max_records}, saving and stopping...", flush=True)
                 self.save()
                 self.total_records += 1  # 防止重复打印
             return
@@ -184,8 +222,9 @@ class TopKLocalityCollector:
         self.total_records += 1
 
         # 定期自动保存
-        if self.total_records % self.save_interval == 0:
-            print(f"[TopKCollector] Auto-saving at {self.total_records} records...")
+        if self.save_interval > 0 and self.total_records % self.save_interval == 0:
+            if self.total_records % (self.save_interval * 10) == 0:
+                print(f"[TopKCollector] Auto-saving at {self.total_records} records..., sessions: {self.total_sessions}")
             self.save()
 
     def _write_readable_log(
@@ -203,14 +242,26 @@ class TopKLocalityCollector:
 
         # 写入头部信息（每个 forward 一行）
         self.log_file.write(f"\n[Session {session_id}][Layer {layer_id}] {mode_name} | seq_len={seq_len} | tokens={num_tokens}\n")
-
-        # 每个 token 一行：pos -> top10 indices
-        for i in range(num_tokens):
-            pos = positions[i].item()
-            # 取前 10 个 indices（如果不足 10 个就全部显示）
-            top_indices = indices[i][:min(10, topk)].tolist()
-            indices_str = ", ".join(map(str, top_indices))
-            self.log_file.write(f"  pos={pos:4d} -> [{indices_str}]\n")
+        # 对于 seq_len 为 2049 的情况特殊打印，把所有 indices 展开显示，方便分析,同时也再加上 sort 过后的 indices，看看两者的区别
+        if seq_len == 2049:
+            self.log_file.write(f"  (Special case: seq_len=2049, showing all indices), topk:{topk},shape of indices: {indices.shape}\n")
+            for i in range(num_tokens):
+                pos = positions[i].item()
+                top_indices = indices[i].tolist() if topk > 0 else []
+                indices_str = ", ".join(map(str, top_indices))
+                self.log_file.write(f"  pos={pos:4d} -> [{indices_str}]\n")
+                # 也打印排序后的 indices
+                sorted_indices = sorted(top_indices)
+                sorted_indices_str = ", ".join(map(str, sorted_indices))
+                self.log_file.write(f"           sorted -> [{sorted_indices_str}]\n")
+        else:
+            # 每个 token 一行：pos -> top10 indices
+            for i in range(num_tokens):
+                pos = positions[i].item()
+                # 取前 10 个 indices（如果不足 10 个就全部显示）
+                top_indices = indices[i][:min(10, topk)].tolist()
+                indices_str = ", ".join(map(str, top_indices))
+                self.log_file.write(f"  pos={pos:4d} -> [{indices_str}]\n")
 
         self.log_file.flush()  # 立即刷新，方便实时查看
 
@@ -238,7 +289,7 @@ class TopKLocalityCollector:
             existing["metadata"]["save_time"] = time.time()
             existing["metadata"]["duration"] = time.time() - existing["metadata"]["start_time"]
             data = existing
-            print(f"[TopKCollector] Appended {appended_count} records, total: {len(existing['records'])} ({len(all_sessions)} sessions)")
+            print(f"[TopKCollector] Appended {appended_count} records, total: {len(existing['records'])} ({len(all_sessions)} sessions)", flush=True)
         else:
             data = {
                 "records": self.records,
@@ -250,7 +301,7 @@ class TopKLocalityCollector:
                     "duration": time.time() - self.start_time,
                 }
             }
-            print(f"[TopKCollector] Saved {len(self.records)} records ({self.total_sessions} sessions) to {save_file}")
+            print(f"[TopKCollector] Saved {len(self.records)} records ({self.total_sessions} sessions) to {save_file}", flush=True)
 
         torch.save(data, save_file)
 

@@ -933,11 +933,14 @@ class Indexer(MultiPlatformOp):
                 # 辅助函数：收集 topk indices
 
         def _maybe_collect_topk(topk_result):
+            # max_kv_len = forward_batch.seq_lens_cpu.max().item()
+            # if(max_kv_len > self.index_topk): 
+                # print(f"topk result:{topk_result}, shape: {topk_result.shape}, max_kv_len: {max_kv_len}", flush=True)
             from sglang.srt.layers.attention.nsa.topk_locality_collector import (
                 get_collector,
             )
-            if not torch.cuda.is_current_stream_capturing():
-                print(f"[DEBUG] _maybe_collect_topk called, topk_result is None: {topk_result is None}")
+            # if not torch.cuda.is_current_stream_capturing():
+            #     print(f"[DEBUG] _maybe_collect_topk called, topk_result is None: {topk_result is None}")
             collector = get_collector()
             if collector.enabled and topk_result is not None:
                 # 获取序列长度（单 batch 模式，取最大值）
@@ -960,7 +963,7 @@ class Indexer(MultiPlatformOp):
         # Optimization: fast path when skipping topk computation
         if skip_logits_computation and (not self.nsa_enable_prefill_cp):
             if not torch.cuda.is_current_stream_capturing():
-                print(f"[DEBUG] skip_logits_computation fast path: max_kv_len={forward_batch.seq_lens_cpu.max().item() if forward_batch.seq_lens_cpu is not None else 'N/A'}, index_topk={self.index_topk}")
+                print(f"[DEBUG] skip_logits_computation fast path: max_kv_len={forward_batch.seq_lens_cpu.max().item() if forward_batch.seq_lens_cpu is not None else 'N/A'}, index_topk={self.index_topk}",flush=True)
             return self._forward_cuda_k_only(
                 x,
                 positions,
@@ -1070,11 +1073,13 @@ class Indexer(MultiPlatformOp):
                 topk_result = self._get_topk_paged(
                     forward_batch, layer_id, q_fp8, weights, metadata
                 )
+                # print("in decode topk_paged")
             else:
                 if (
                     forward_batch.nsa_cp_metadata is not None
                     and is_nsa_prefill_cp_in_seq_split()
                 ):
+                    # print("in extend topk_ragged_with_cp")
                     kv_len_prev = forward_batch.nsa_cp_metadata.kv_len_prev
                     kv_len_next = forward_batch.nsa_cp_metadata.kv_len_next
                     actual_seq_q_prev = forward_batch.nsa_cp_metadata.actual_seq_q_prev
@@ -1112,10 +1117,12 @@ class Indexer(MultiPlatformOp):
                     topk_result = torch.cat([topk_result_prev, topk_result_next], dim=0)
                     return _maybe_collect_topk(topk_result)
                 else:
+                    # print("in extend topk_ragged")
                     topk_result = self._get_topk_ragged(
                         forward_batch, layer_id, q_fp8, weights, metadata
                     )
         else:
+            print("in npu forward_indexer")
             topk_result = self.forward_indexer(
                 q_fp8.contiguous(),
                 weights,

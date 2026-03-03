@@ -2,13 +2,14 @@
 # DeepSeek V3.2 启动脚本 - 8卡配置
 # 模型路径: /mnt/shared/models/DeepSeek-V3.2
 
-MODEL_PATH="/mnt/shared/models/DeepSeek-V3.2"
+MODEL_PATH="/ufs/models/DeepSeek-V3.2-Exp"
 PORT="${PORT:-30000}"  # 可通过环境变量覆盖，如: PORT=31000 ./run.sh
 HOST="0.0.0.0"
+SGLANG_LOG_LEVEL="debug"  # 可设置为 debug 以获取更多日志输出
 
 # 层数设置 (设置为空或0表示使用全部层)
 # DeepSeek V3.2 原模型共61层
-NUM_LAYERS="10"
+NUM_LAYERS="0"
 
 # CUDA Graph 设置 (设置为1禁用，用于收集 decode 阶段数据)
 # 注意: 禁用 CUDA graph 会降低性能，仅在需要调试/收集数据时使用
@@ -20,7 +21,7 @@ SKIP_WARMUP="1"
 
 # TopK Collector 保存间隔 (默认等于层数，即每个 decode step 保存一次)
 # 设置为空则使用 NUM_LAYERS 作为默认值
-NSA_SAVE_INTERVAL=""
+NSA_SAVE_INTERVAL="1000"
 
 # DeepGEMM 预编译设置 (默认跳过，设置为0启用)
 # 注意: 跳过预编译会导致首次推理时编译，建议先运行 './run.sh compile'
@@ -36,6 +37,14 @@ build_extra_args() {
     EXTRA_ARGS=""
 
     echo ">>> 服务端口: ${PORT}"
+
+    # 设置日志级别
+    if [ -n "${SGLANG_LOG_LEVEL}" ]; then
+        EXTRA_ARGS="${EXTRA_ARGS} --log-level ${SGLANG_LOG_LEVEL}"
+        echo ">>> 日志级别: ${SGLANG_LOG_LEVEL}"
+    else
+        echo ">>> 日志级别: 默认"
+    fi
 
     # 层数设置
     if [ -n "${NUM_LAYERS}" ] && [ "${NUM_LAYERS}" -gt 0 ] 2>/dev/null; then

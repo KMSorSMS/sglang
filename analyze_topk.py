@@ -407,6 +407,128 @@ def analyze_decode_stability(data: Dict, layer_id: Optional[int] = None):
                 print(f"    step {prev_p} -> {curr_p}: {overlaps[i]:.1%}")
 
 
+def analyze_adjacent_step_overlap(
+    data: Dict,
+    layer_id: Optional[int] = None,
+    session_id: Optional[int] = None,
+    mode: str = "decode",
+    include_gaps: bool = False,
+    per_session: bool = False,
+):
+    """分析同一层相邻 step 的重叠率（Jaccard）。
+
+    - 相邻 step: 默认只统计 position 差值为 1 的连续步（更贴近“逐 token decode step”）。
+    - include_gaps=True: 也把 delta>1 的步纳入统计（用于数据不连续/分块时的粗略观察）。
+    - mode: decode / extend / all
+    """
+    records = data.get("records", [])
+    layer_ids = get_layer_ids(data)
+    if not layer_ids:
+        print("没有找到任何 layer 记录")
+        return
+
+    layers_to_analyze = [layer_id] if layer_id is not None else layer_ids
+
+    mode_upper = mode.upper()
+    if mode_upper not in ("DECODE", "EXTEND", "ALL"):
+        raise ValueError(f"Invalid mode: {mode}")
+
+    session_ids = get_session_ids(data)
+    if session_id is not None:
+        if session_id not in session_ids:
+            print(f"错误: session_id={session_id} 不存在，可用的 session IDs: {session_ids}")
+            return
+        target_sessions = [session_id]
+    else:
+        target_sessions = session_ids
+
+    print("=" * 60)
+    if layer_id is None:
+        print("同层相邻 Step 重叠率 (All Layers)")
+    else:
+        print(f"同层相邻 Step 重叠率 (Layer {layer_id})")
+    print("=" * 60)
+    print(f"mode={mode_upper}, include_gaps={include_gaps}")
+
+    any_layer_has_data = False
+
+    for lid in layers_to_analyze:
+        layer_overlaps: List[float] = []
+
+        for sid in target_sessions:
+            # 收集 (pos -> indices_set)，同时兼容 EXTEND(多pos) 和 DECODE(单pos)
+            pos_to_indices: Dict[int, set] = {}
+            for r in records:
+                if r.get("layer_id") != lid:
+                    continue
+                if r.get("session_id", 0) != sid:
+                    continue
+
+                fm = str(r.get("forward_mode", "unknown")).upper()
+                if mode_upper != "ALL" and fm != mode_upper:
+                    continue
+
+                positions = r.get("positions")
+                indices = r.get("topk_indices")
+                if positions is None or indices is None:
+                    continue
+
+                for i in range(int(positions.shape[0])):
+                    pos = int(positions[i].item())
+                    pos_to_indices[pos] = set(int(x) for x in indices[i].tolist())
+
+            if len(pos_to_indices) < 2:
+                continue
+
+            sorted_pos = sorted(pos_to_indices.keys())
+            overlaps: List[float] = []
+
+            prev_pos = sorted_pos[0]
+            prev_set = pos_to_indices[prev_pos]
+            for curr_pos in sorted_pos[1:]:
+                curr_set = pos_to_indices[curr_pos]
+                delta = curr_pos - prev_pos
+                if delta <= 0:
+                    prev_pos, prev_set = curr_pos, curr_set
+                    continue
+                if (not include_gaps) and delta != 1:
+                    prev_pos, prev_set = curr_pos, curr_set
+                    continue
+
+                denom = len(prev_set | curr_set)
+                jaccard = (len(prev_set & curr_set) / denom) if denom else 1.0
+                overlaps.append(jaccard)
+                prev_pos, prev_set = curr_pos, curr_set
+
+            if not overlaps:
+                continue
+
+            if per_session:
+                t = torch.tensor(overlaps, dtype=torch.float)
+                print(
+                    f"Layer {lid} | Session {sid}: steps={len(overlaps)} | mean={t.mean().item():.1%} | "
+                    f"median={t.median().item():.1%} | min={t.min().item():.1%} | max={t.max().item():.1%}"
+                ,flush=True)
+
+            layer_overlaps.extend(overlaps)
+
+        if not layer_overlaps:
+            continue
+
+        any_layer_has_data = True
+        t_layer = torch.tensor(layer_overlaps, dtype=torch.float)
+        print(
+            f"Layer {lid}: steps={len(layer_overlaps)} | mean={t_layer.mean().item():.1%} | "
+            f"median={t_layer.median().item():.1%} | min={t_layer.min().item():.1%} | max={t_layer.max().item():.1%}"
+        ,flush=True)
+
+    if not any_layer_has_data:
+        print("没有足够的相邻 step 数据。可以尝试:")
+        print("  - 用 --mode all 覆盖 EXTEND+DECODE")
+        print("  - 加 --include-gaps 放宽连续性限制")
+        return
+
+
 def plot_intra_layer_similarity(data: Dict, output_dir: str = "."):
     """
     绘制论文风格的 Intra-Layer Similarity 热力图
@@ -660,18 +782,24 @@ def plot_decode_stability(data: Dict, output_dir: str = "."):
 
 def main():
     parser = argparse.ArgumentParser(description="分析 TopK Locality 数据")
-    parser.add_argument("file", nargs="?", default="topk_locality_data/topk_raw_data.pt",
+    parser.add_argument("--file", nargs="?", default="topk_locality_data/topk_raw_data.pt",
                         help="数据文件路径")
     parser.add_argument("--records", "-r", type=int, default=0,
                         help="显示的记录数量 (0=不显示)")
     parser.add_argument("--layer", "-l", type=int, default=None,
-                        help="分析的层 ID (默认=第一层)")
+                        help="分析的层 ID (不指定则分析所有层)")
     parser.add_argument("--session", "-s", type=int, default=None,
                         help="只分析指定的 session ID (默认=全部)")
     parser.add_argument("--plot", "-p", action="store_true",
                         help="生成可视化图表")
     parser.add_argument("--output", "-o", type=str, default=".",
                         help="图表输出目录")
+    parser.add_argument("--mode", type=str, default="all", choices=["decode", "extend", "all"],
+                        help="相邻 step 重叠率统计使用的 forward_mode (默认: all)")
+    parser.add_argument("--include-gaps", action="store_true",
+                        help="把 position 不连续(delta>1)的步也计入重叠率统计")
+    parser.add_argument("--no-per-session", action="store_true",
+                        help="不打印每个 session 的相邻 step 重叠率统计 (默认会打印)")
     args = parser.parse_args()
 
     file_path = Path(args.file)
@@ -705,14 +833,24 @@ def main():
     if args.records > 0:
         print_records(data, args.records)
 
-    # 距离分析
-    analyze_distance(data, args.layer)
+    # 我们关心的核心指标：同一层相邻 step 重叠率（cache 潜力）
+    analyze_adjacent_step_overlap(
+        data,
+        layer_id=args.layer,
+        session_id=args.session,
+        mode=args.mode,
+        include_gaps=args.include_gaps,
+        per_session=not args.no_per_session,
+    )
 
-    # 跨层一致性
-    analyze_cross_layer(data)
+    # # 距离分析
+    # analyze_distance(data, args.layer)
 
-    # Decode 稳定性
-    analyze_decode_stability(data, args.layer)
+    # # 跨层一致性
+    # analyze_cross_layer(data)
+
+    # # Decode 稳定性
+    # analyze_decode_stability(data, args.layer)
 
     # 生成图表
     if args.plot:

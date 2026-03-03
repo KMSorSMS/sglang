@@ -5,10 +5,10 @@ import os
 import sys
 
 # 禁用代理，避免本地请求走代理
-os.environ.pop("http_proxy", None)
-os.environ.pop("https_proxy", None)
-os.environ.pop("HTTP_PROXY", None)
-os.environ.pop("HTTPS_PROXY", None)
+# os.environ.pop("http_proxy", None)
+# os.environ.pop("https_proxy", None)
+# os.environ.pop("HTTP_PROXY", None)
+# os.environ.pop("HTTPS_PROXY", None)
 
 # 检查是否需要使用 HuggingFace 镜像 (需要在 import datasets 之前设置)
 if "--longbench" in sys.argv and "--no-mirror" not in sys.argv:
