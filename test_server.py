@@ -21,10 +21,55 @@ import time
 from pathlib import Path
 
 SERVER_URL = "http://127.0.0.1:30000"
+DEFAULT_SYSTEM_PROMPT = os.getenv(
+    "TEST_SERVER_SYSTEM_PROMPT",
+    "You are a helpful, accurate, and concise assistant.",
+)
 
 
-def generate(prompt: str, max_tokens: int = 256, temperature: float = 0.7, stream: bool = False):
-    """发送生成请求到服务器"""
+def with_system_prompt(prompt: str, system_prompt: str) -> str:
+    """为纯文本 generate 请求注入默认 system prompt。"""
+    if not system_prompt:
+        return prompt
+    return f"System instruction:\n{system_prompt}\n\nUser request:\n{prompt}"
+
+
+def ensure_system_message(messages: list, system_prompt: str) -> list:
+    """为 chat 请求确保首条为 system message（若未提供）。"""
+    if not system_prompt:
+        return messages
+    if messages and messages[0].get("role") == "system":
+        return messages
+    return [{"role": "system", "content": system_prompt}, *messages]
+
+
+def request_completion(
+    prompt: str,
+    max_tokens: int,
+    temperature: float,
+    system_prompt: str,
+    timeout: int = 300,
+):
+    """统一请求入口：有 system_prompt 时优先走 chat-completions。"""
+    if system_prompt:
+        messages = ensure_system_message(
+            [{"role": "user", "content": prompt}], system_prompt
+        )
+        payload = {
+            "model": "default",
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        response = requests.post(
+            f"{SERVER_URL}/v1/chat/completions", json=payload, timeout=timeout
+        )
+        result = response.json()
+        output_text = ""
+        if "choices" in result and result["choices"]:
+            output_text = result["choices"][0].get("message", {}).get("content", "")
+        return "chat", payload, response, result, output_text
+
     payload = {
         "text": prompt,
         "sampling_params": {
@@ -32,8 +77,29 @@ def generate(prompt: str, max_tokens: int = 256, temperature: float = 0.7, strea
             "temperature": temperature,
         },
     }
+    response = requests.post(f"{SERVER_URL}/generate", json=payload, timeout=timeout)
+    result = response.json()
+    output_text = result.get("text", "")
+    return "generate", payload, response, result, output_text
 
+
+def generate(
+    prompt: str,
+    max_tokens: int = 256,
+    temperature: float = 0.7,
+    stream: bool = False,
+    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+):
+    """发送生成请求到服务器"""
     if stream:
+        final_prompt = with_system_prompt(prompt, system_prompt)
+        payload = {
+            "text": final_prompt,
+            "sampling_params": {
+                "max_new_tokens": max_tokens,
+                "temperature": temperature,
+            },
+        }
         payload["stream"] = True
         response = requests.post(f"{SERVER_URL}/generate", json=payload, stream=True)
         print("Response (streaming):")
@@ -43,19 +109,25 @@ def generate(prompt: str, max_tokens: int = 256, temperature: float = 0.7, strea
                 print(data.get("text", ""), end="", flush=True)
         print()
     else:
-        response = requests.post(f"{SERVER_URL}/generate", json=payload)
-        result = response.json()
+        _, _, response, result, output_text = request_completion(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            system_prompt=system_prompt,
+            timeout=300,
+        )
         print("Response:")
-        print(result.get("text", result))
+        print(output_text if output_text else result)
 
     return response
 
 
-def chat(messages: list, max_tokens: int = 256, temperature: float = 0.7):
+def chat(messages: list, max_tokens: int = 256, temperature: float = 0.7, system_prompt: str = DEFAULT_SYSTEM_PROMPT):
     """发送聊天请求（OpenAI 兼容格式）"""
+    final_messages = ensure_system_message(messages, system_prompt)
     payload = {
         "model": "default",
-        "messages": messages,
+        "messages": final_messages,
         "max_tokens": max_tokens,
         "temperature": temperature,
     }
@@ -267,6 +339,7 @@ def test_longbench_v2(
     use_mirror: bool = True,
     model_path: str = None,
     force_recompute: bool = False,
+    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
 ):
     """
     使用 LongBench V2 数据集测试不同 context length
@@ -317,20 +390,31 @@ def test_longbench_v2(
             # 发送请求
             start_time = time.time()
             try:
-                payload = {
-                    "text": prompt,
-                    "sampling_params": {
-                        "max_new_tokens": max_tokens,
-                        "temperature": temperature,
-                    },
-                }
-                response = requests.post(f"{SERVER_URL}/generate", json=payload, timeout=600)
-                result = response.json()
+                endpoint, payload, response, result, output_text = request_completion(
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    system_prompt=system_prompt,
+                    timeout=600,
+                )
+                # for debug print the payload
+                # print(f"请求端点: {endpoint}")
+                # print("请求 payload:")
+                # print(json.dumps(payload, indent=2, ensure_ascii=False))
+                # print(f"HTTP Response: {response}")
+                # print("HTTP Body:")
+                # print(response.text)
                 elapsed = time.time() - start_time
 
-                output_text = result.get("text", "")
+                if endpoint == "chat" and "choices" in result and result["choices"]:
+                    finish_reason = result["choices"][0].get("finish_reason")
+                    print(f"finish_reason: {finish_reason}")
+                elif endpoint == "generate":
+                    finish_reason = result.get("meta_info", {}).get("finish_reason")
+                    print(f"finish_reason: {finish_reason}")
                 print(f"生成完成，耗时 {elapsed:.1f}s")
-                print(f"输出: {output_text[:200]}...")
+                print("输出:")
+                print(output_text)
 
                 # 检查答案
                 answer = item.get('answer', '')
@@ -375,6 +459,7 @@ def test_multiple_lengths(
     max_tokens: int = 128,
     temperature: float = 0.7,
     base_file: str = None,
+    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
 ):
     """
     测试多个不同的 context length
@@ -409,20 +494,28 @@ def test_multiple_lengths(
         # 发送请求
         start_time = time.time()
         try:
-            payload = {
-                "text": prompt,
-                "sampling_params": {
-                    "max_new_tokens": max_tokens,
-                    "temperature": temperature,
-                },
-            }
-            response = requests.post(f"{SERVER_URL}/generate", json=payload, timeout=300)
-            result = response.json()
+            endpoint, payload, response, result, output_text = request_completion(
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                system_prompt=system_prompt,
+                timeout=300,
+            )
+            print(f"请求端点: {endpoint}")
+            print(f"HTTP Response: {response}")
+            print("HTTP Body:")
+            print(response.text)
             elapsed = time.time() - start_time
 
-            output_text = result.get("text", "")
+            if endpoint == "chat" and "choices" in result and result["choices"]:
+                finish_reason = result["choices"][0].get("finish_reason")
+                print(f"finish_reason: {finish_reason}")
+            elif endpoint == "generate":
+                finish_reason = result.get("meta_info", {}).get("finish_reason")
+                print(f"finish_reason: {finish_reason}")
             print(f"生成完成，耗时 {elapsed:.1f}s")
-            print(f"输出: {output_text[:100]}...")
+            print("输出:")
+            print(output_text)
 
             results.append({
                 "context_length": target_len,
@@ -484,8 +577,13 @@ def main():
                         help="不使用 Hugging Face 国内镜像 (默认使用 hf-mirror.com)")
     parser.add_argument("--recompute", action="store_true",
                         help="强制重新计算 token 数，忽略缓存")
+    parser.add_argument("--system-prompt", type=str, default=DEFAULT_SYSTEM_PROMPT,
+                        help="默认注入到所有请求的 system prompt")
+    parser.add_argument("--no-system-prompt", action="store_true",
+                        help="禁用默认 system prompt 注入")
 
     args = parser.parse_args()
+    system_prompt = "" if args.no_system_prompt else args.system_prompt
 
     # LongBench V2 测试模式
     if args.longbench:
@@ -498,6 +596,7 @@ def main():
             use_mirror=not args.no_mirror,
             model_path=args.model_path,
             force_recompute=args.recompute,
+            system_prompt=system_prompt,
         )
         return
 
@@ -509,6 +608,7 @@ def main():
             max_tokens=args.max_tokens,
             temperature=args.temperature,
             base_file=args.file,
+            system_prompt=system_prompt,
         )
         return
 
@@ -527,9 +627,9 @@ def main():
 
     if args.chat:
         messages = [{"role": "user", "content": prompt}]
-        chat(messages, args.max_tokens, args.temperature)
+        chat(messages, args.max_tokens, args.temperature, system_prompt=system_prompt)
     else:
-        generate(prompt, args.max_tokens, args.temperature, args.stream)
+        generate(prompt, args.max_tokens, args.temperature, args.stream, system_prompt=system_prompt)
 
 
 if __name__ == "__main__":

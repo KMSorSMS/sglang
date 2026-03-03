@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import os
 import atexit
+import signal
+import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional
@@ -71,9 +73,12 @@ class TopKLocalityCollector:
     def __init__(self):
         self.enabled = os.getenv("NSA_COLLECT_TOPK", "1") == "1"
         self.save_path = Path(os.getenv("NSA_TOPK_SAVE_PATH", "./topk_locality_data"))
-        self.max_records = int(os.getenv("NSA_MAX_RECORDS", "100000"))
+        self.max_records = int(os.getenv("NSA_MAX_RECORDS", "1000000"))
         self.save_interval = int(os.getenv("NSA_SAVE_INTERVAL", "500"))
         self.save_on_exit = os.getenv("NSA_SAVE_ON_EXIT", "1") == "1"
+        # Optional: external trigger to request a save, e.g. `kill -USR1 <pid>`.
+        # Empty/0 disables. Currently supports: USR1, USR2.
+        self.save_on_signal = os.getenv("NSA_SAVE_ON_SIGNAL", "USR1").strip().upper()
         self.log_to_file = os.getenv("NSA_LOG_TO_FILE", "1") == "1"  # 是否输出可读日志
         print(f"[TopKCollector] Initializing TopKLocalityCollector...")
 
@@ -84,6 +89,9 @@ class TopKLocalityCollector:
         self.total_records = 0
         self.start_time = time.time()
         self.file_counter = 0
+
+        self._save_requested = False
+        self._save_lock = threading.Lock()
 
         # Session 追踪: 每次 prefill (EXTEND) 开始时递增
         self.current_session_id = 0
@@ -99,6 +107,9 @@ class TopKLocalityCollector:
             print(f"[TopKCollector] Enabled, saving to {self.save_path}")
             print(f"[TopKCollector] Max records: {self.max_records}, save interval: {self.save_interval}")
 
+            if self.save_on_signal not in ("", "0"):
+                self._install_signal_handler(self.save_on_signal)
+
             if self.save_on_exit:
                 self._install_atexit_handler()
 
@@ -106,6 +117,27 @@ class TopKLocalityCollector:
                 # 只在 init 打开文件，不写 banner/不打印；真正开始记录时再输出提示。
                 self._log_path = self.save_path / "topk_readable.log"
                 self.log_file = open(self._log_path, "a")  # 追加模式
+
+    def _install_signal_handler(self, signal_name: str):
+        sig = None
+        if signal_name == "USR1":
+            sig = getattr(signal, "SIGUSR1", None)
+        elif signal_name == "USR2":
+            sig = getattr(signal, "SIGUSR2", None)
+
+        if sig is None:
+            print(f"[TopKCollector] NSA_SAVE_ON_SIGNAL={signal_name} not supported on this platform; ignoring.")
+            return
+
+        def _handler(_signum, _frame):
+            self._save_requested = True
+            print(f"[TopKCollector] Save requested via signal {signal_name}", flush=True)
+
+        try:
+            signal.signal(sig, _handler)
+            print(f"[TopKCollector] External save trigger enabled: {signal_name}")
+        except Exception as e:
+            print(f"[TopKCollector] Failed to install signal handler ({signal_name}): {e}")
 
     def _write_readable_log_banner(self, session_id: int):
         if self.log_file is None:
@@ -222,6 +254,10 @@ class TopKLocalityCollector:
         self.total_records += 1
 
         # 定期自动保存
+        if self._save_requested:
+            self._save_requested = False
+            self.save()
+
         if self.save_interval > 0 and self.total_records % self.save_interval == 0:
             if self.total_records % (self.save_interval * 10) == 0:
                 print(f"[TopKCollector] Auto-saving at {self.total_records} records..., sessions: {self.total_sessions}")
@@ -269,6 +305,17 @@ class TopKLocalityCollector:
         """保存收集的原始数据（单文件追加模式）"""
         if not self.enabled or len(self.records) == 0:
             return
+
+        # Avoid re-entrancy (e.g. autosave + signal request close together)
+        if not self._save_lock.acquire(blocking=False):
+            return
+        try:
+            return self._save_impl(filename)
+        finally:
+            self._save_lock.release()
+
+    def _save_impl(self, filename: Optional[str] = None):
+        """Internal save implementation. Caller must hold _save_lock."""
 
         if filename is None:
             filename = "topk_raw_data.pt"
