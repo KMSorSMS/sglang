@@ -64,6 +64,7 @@ def cutlass_w4a8_moe(
     a2_scale: Optional[torch.Tensor] = None,
     apply_router_weight_on_input: bool = False,
     routed_scaling_factor: float = 1.0,
+    group_size: int = 128,
 ) -> torch.Tensor:
     """
     This function computes a w4a8-quantized Mixture of Experts (MoE) layer
@@ -80,10 +81,8 @@ def cutlass_w4a8_moe(
     - w2_q (torch.Tensor): The second set of int4-quantized expert weights.
         Shape: [num_experts, K, N // 2]
         (the weights are passed transposed and int4-packed)
-    - w1_scale (torch.Tensor): The fp32 scale to dequantize w1_q.
-        Shape: [num_experts, K // 512, N * 8]
-    - w2_scale (torch.Tensor): The fp32 scale to dequantize w2_q.
-        Shape: [num_experts, N // 512, K * 4]
+    - w1_scale (torch.Tensor): The packed scale to dequantize w1_q.
+    - w2_scale (torch.Tensor): The packed scale to dequantize w2_q.
     - topk_weights (torch.Tensor): The weights of each token->expert mapping.
     - topk_ids (torch.Tensor): The ids of each token->expert mapping.
     - a_strides1 (torch.Tensor): The input strides of the first grouped gemm.
@@ -128,8 +127,7 @@ def cutlass_w4a8_moe(
         assert topk == 1, "apply_router_weight_on_input is only implemented for topk=1"
 
     device = a.device
-    if get_parallel().moe_ep_size > 1:
-        topk_ids = torch.where(topk_ids == -1, num_local_experts, topk_ids)
+    topk_ids = torch.where(topk_ids == -1, num_local_experts, topk_ids)
 
     src2dst = cutlass_w4_run_moe_ep_preproess(
         topk_ids,
@@ -190,7 +188,7 @@ def cutlass_w4a8_moe(
         b_strides1,
         c_strides1,
         s_strides13,
-        128,
+        group_size,
         topk,
     )
 
@@ -220,7 +218,7 @@ def cutlass_w4a8_moe(
         b_strides2,
         c_strides2,
         s_strides2,
-        128,
+        group_size,
         topk,
     )
 
@@ -262,6 +260,7 @@ def cutlass_w4a8_moe_deepep_normal(
     problem_sizes2: torch.Tensor,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
+    group_size: int = 128,
 ) -> torch.Tensor:
     """
     This function computes a w4a8-quantized Mixture of Experts (MoE) layer
@@ -278,10 +277,8 @@ def cutlass_w4a8_moe_deepep_normal(
     - w2_q (torch.Tensor): The second set of int4-quantized expert weights.
         Shape: [num_experts, K, N // 2]
         (the weights are passed transposed and int4-packed)
-    - w1_scale (torch.Tensor): The fp32 scale to dequantize w1_q.
-        Shape: [num_experts, K // 512, N * 8]
-    - w2_scale (torch.Tensor): The fp32 scale to dequantize w2_q.
-        Shape: [num_experts, N // 512, K * 4]
+    - w1_scale (torch.Tensor): The packed scale to dequantize w1_q.
+    - w2_scale (torch.Tensor): The packed scale to dequantize w2_q.
     - topk_weights (torch.Tensor): The weights of each token->expert mapping.
     - a_strides1 (torch.Tensor): The input strides of the first grouped gemm.
     - b_strides1 (torch.Tensor): The weights strides of the first grouped gemm.
@@ -385,7 +382,7 @@ def cutlass_w4a8_moe_deepep_normal(
         b_strides1,
         c_strides1,
         s_strides13,
-        128,
+        group_size,
         topk,
     )
     intermediate = torch.empty((m * topk, n), device=device, dtype=torch.bfloat16)
@@ -408,7 +405,7 @@ def cutlass_w4a8_moe_deepep_normal(
         b_strides2,
         c_strides2,
         s_strides2,
-        128,
+        group_size,
         topk,
     )
     num_tokens = src2dst.shape[0] // topk
@@ -453,6 +450,7 @@ def cutlass_w4a8_moe_deepep_ll(
     problem_sizes2: torch.Tensor,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
+    group_size: int = 128,
 ) -> torch.Tensor:
     """
     This function computes a w4a8-quantized Mixture of Experts (MoE) layer
@@ -469,10 +467,8 @@ def cutlass_w4a8_moe_deepep_ll(
     - w2_q (torch.Tensor): The second set of int4-quantized expert weights.
         Shape: [num_experts, K, N // 2]
         (the weights are passed transposed and int4-packed)
-    - w1_scale (torch.Tensor): The fp32 scale to dequantize w1_q.
-        Shape: [num_experts, K // 512, N * 8]
-    - w2_scale (torch.Tensor): The fp32 scale to dequantize w2_q.
-        Shape: [num_experts, N // 512, K * 4]
+    - w1_scale (torch.Tensor): The packed scale to dequantize w1_q.
+    - w2_scale (torch.Tensor): The packed scale to dequantize w2_q.
     - topk_weights (torch.Tensor): The weights of each token->expert mapping.
     - a_strides1 (torch.Tensor): The input strides of the first grouped gemm.
     - b_strides1 (torch.Tensor): The weights strides of the first grouped gemm.
@@ -545,7 +541,7 @@ def cutlass_w4a8_moe_deepep_ll(
         b_strides1,
         c_strides1,
         s_strides13,
-        128,
+        group_size,
         topk,
     )
 
@@ -567,7 +563,7 @@ def cutlass_w4a8_moe_deepep_ll(
         b_strides2,
         c_strides2,
         s_strides2,
-        128,
+        group_size,
         topk,
     )
 
