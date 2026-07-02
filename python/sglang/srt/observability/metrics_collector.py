@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
+METRICS_PREFIX = os.getenv("METRICS_PREFIX", "sglang")
 
 logger = logging.getLogger(__name__)
 
@@ -267,37 +268,37 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # Basics
         # =================================================================
         self.num_running_reqs = Gauge(
-            name="sglang:num_running_reqs",
+            name=f"{METRICS_PREFIX}:num_running_reqs",
             documentation="The number of running requests.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
         self.num_queue_reqs = Gauge(
-            name="sglang:num_queue_reqs",
+            name=f"{METRICS_PREFIX}:num_queue_reqs",
             documentation="The number of requests in the waiting queue.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
         self.num_grammar_queue_reqs = Gauge(
-            name="sglang:num_grammar_queue_reqs",
+            name=f"{METRICS_PREFIX}:num_grammar_queue_reqs",
             documentation="The number of requests in the grammar waiting queue.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
         self.gen_throughput = Gauge(
-            name="sglang:gen_throughput",
+            name=f"{METRICS_PREFIX}:gen_throughput",
             documentation="The generation throughput (token/s).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
         self.cache_hit_rate = Gauge(
-            name="sglang:cache_hit_rate",
+            name=f"{METRICS_PREFIX}:cache_hit_rate",
             documentation="The prefix cache hit rate.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
         self.decode_sum_seq_lens = Gauge(
-            name="sglang:decode_sum_seq_lens",
+            name=f"{METRICS_PREFIX}:decode_sum_seq_lens",
             documentation="The sum of all sequence lengths in decode.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
@@ -307,25 +308,25 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # Memory pool usage ratios
         # =================================================================
         self.token_usage = Gauge(
-            name="sglang:token_usage",
+            name=f"{METRICS_PREFIX}:token_usage",
             documentation="The token usage.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
         self.full_token_usage = Gauge(
-            name="sglang:full_token_usage",
+            name=f"{METRICS_PREFIX}:full_token_usage",
             documentation="The token usage for full attention layers.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
         self.swa_token_usage = Gauge(
-            name="sglang:swa_token_usage",
+            name=f"{METRICS_PREFIX}:swa_token_usage",
             documentation="The token usage for SWA layers.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
         self.mamba_usage = Gauge(
-            name="sglang:mamba_usage",
+            name=f"{METRICS_PREFIX}:mamba_usage",
             documentation="The token usage for Mamba layers.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
@@ -335,25 +336,25 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # Absolute token counts
         # =================================================================
         self.num_used_tokens = Gauge(
-            name="sglang:num_used_tokens",
+            name=f"{METRICS_PREFIX}:num_used_tokens",
             documentation="The number of used tokens.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
         self.kv_available_tokens = Gauge(
-            name="sglang:kv_available_tokens",
+            name=f"{METRICS_PREFIX}:kv_available_tokens",
             documentation="Number of free token slots in the KV cache pool.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
         self.kv_evictable_tokens = Gauge(
-            name="sglang:kv_evictable_tokens",
+            name=f"{METRICS_PREFIX}:kv_evictable_tokens",
             documentation="Number of evictable (radix-cached) token slots in the KV cache pool.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
         self.kv_used_tokens = Gauge(
-            name="sglang:kv_used_tokens",
+            name=f"{METRICS_PREFIX}:kv_used_tokens",
             documentation="Number of actively used token slots in the KV cache pool.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
@@ -414,13 +415,13 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # Speculative decoding
         # =================================================================
         self.spec_accept_length = Gauge(
-            name="sglang:spec_accept_length",
+            name=f"{METRICS_PREFIX}:spec_accept_length",
             documentation="Mean acceptance length of speculative decoding (accepted drafts + bonus token per forward).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
         self.spec_accept_rate = Gauge(
-            name="sglang:spec_accept_rate",
+            name=f"{METRICS_PREFIX}:spec_accept_rate",
             documentation="Speculative acceptance rate (`accepted drafts / proposed drafts` in batch).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
@@ -455,28 +456,28 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # =================================================================
         # TODO maybe remove this old gauge in favor of the new counter
         self.num_retracted_reqs = Gauge(
-            name="sglang:num_retracted_reqs",
+            name=f"{METRICS_PREFIX}:num_retracted_reqs",
             documentation="The number of retracted requests.",
             labelnames=labels.keys(),
         )
         self.num_retracted_reqs_total = Counter(
             # The name is `requests` instead of `reqs` to avoid dup name error
-            name="sglang:num_retracted_requests_total",
+            name=f"{METRICS_PREFIX}:num_retracted_requests_total",
             documentation="Total number of retracted requests.",
             labelnames=labels.keys(),
         )
         self.num_retracted_input_tokens_total = Counter(
-            name="sglang:num_retracted_input_tokens_total",
+            name=f"{METRICS_PREFIX}:num_retracted_input_tokens_total",
             documentation="Total number of retracted input tokens.",
             labelnames=labels.keys(),
         )
         self.num_retracted_output_tokens_total = Counter(
-            name="sglang:num_retracted_output_tokens_total",
+            name=f"{METRICS_PREFIX}:num_retracted_output_tokens_total",
             documentation="Total number of retracted output tokens.",
             labelnames=labels.keys(),
         )
         self.num_paused_reqs = Gauge(
-            name="sglang:num_paused_reqs",
+            name=f"{METRICS_PREFIX}:num_paused_reqs",
             documentation="The number of paused requests by async weight sync.",
             labelnames=labels.keys(),
         )
@@ -485,76 +486,76 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # PD disaggregation
         # =================================================================
         self.num_prefill_bootstrap_queue_reqs = Gauge(
-            name="sglang:num_prefill_bootstrap_queue_reqs",
+            name=f"{METRICS_PREFIX}:num_prefill_bootstrap_queue_reqs",
             documentation="The number of requests in the prefill bootstrap queue.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
         self.num_prefill_inflight_queue_reqs = Gauge(
-            name="sglang:num_prefill_inflight_queue_reqs",
+            name=f"{METRICS_PREFIX}:num_prefill_inflight_queue_reqs",
             documentation="The number of requests in the prefill inflight queue.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
         self.num_decode_prealloc_queue_reqs = Gauge(
-            name="sglang:num_decode_prealloc_queue_reqs",
+            name=f"{METRICS_PREFIX}:num_decode_prealloc_queue_reqs",
             documentation="The number of requests in the decode prealloc queue.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
         self.num_decode_transfer_queue_reqs = Gauge(
-            name="sglang:num_decode_transfer_queue_reqs",
+            name=f"{METRICS_PREFIX}:num_decode_transfer_queue_reqs",
             documentation="The number of requests in the decode transfer queue.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
         self.kv_transfer_speed_gb_s = Histogram(
-            name="sglang:kv_transfer_speed_gb_s",
+            name=f"{METRICS_PREFIX}:kv_transfer_speed_gb_s",
             documentation="Histogram of KV cache transfer speed in GB/s.",
             labelnames=labels.keys(),
             buckets=(0.1, 0.5, 1, 5, 10, 25, 50, 100, 200, 400),
         )
         self.kv_transfer_latency_ms = Histogram(
-            name="sglang:kv_transfer_latency_ms",
+            name=f"{METRICS_PREFIX}:kv_transfer_latency_ms",
             documentation="Histogram of KV cache transfer latency in ms.",
             labelnames=labels.keys(),
             buckets=(1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000),
         )
         self.pending_prealloc_token_usage = Gauge(
-            name="sglang:pending_prealloc_token_usage",
+            name=f"{METRICS_PREFIX}:pending_prealloc_token_usage",
             documentation="The token usage for pending preallocated tokens (not preallocated yet).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
         self.num_bootstrap_failed_reqs = Counter(
-            name="sglang:num_bootstrap_failed_reqs_total",
+            name=f"{METRICS_PREFIX}:num_bootstrap_failed_reqs_total",
             documentation="The number of bootstrap failed requests.",
             labelnames=labels.keys(),
         )
         self.num_transfer_failed_reqs = Counter(
-            name="sglang:num_transfer_failed_reqs_total",
+            name=f"{METRICS_PREFIX}:num_transfer_failed_reqs_total",
             documentation="The number of transfer failed requests.",
             labelnames=labels.keys(),
         )
         self.num_prefill_retries_total = Counter(
-            name="sglang:num_prefill_retries_total",
+            name=f"{METRICS_PREFIX}:num_prefill_retries_total",
             documentation="Total number of prefill retries.",
             labelnames=labels.keys(),
         )
         self.kv_transfer_bootstrap_ms = Histogram(
-            name="sglang:kv_transfer_bootstrap_ms",
+            name=f"{METRICS_PREFIX}:kv_transfer_bootstrap_ms",
             documentation="Histogram of KV transfer bootstrap time in ms.",
             labelnames=labels.keys(),
             buckets=(1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500),
         )
         self.kv_transfer_alloc_ms = Histogram(
-            name="sglang:kv_transfer_alloc_ms",
+            name=f"{METRICS_PREFIX}:kv_transfer_alloc_ms",
             documentation="Histogram of KV transfer allocation waiting time in ms.",
             labelnames=labels.keys(),
             buckets=(1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500),
         )
         self.kv_transfer_total_mb = Histogram(
-            name="sglang:kv_transfer_total_mb",
+            name=f"{METRICS_PREFIX}:kv_transfer_total_mb",
             documentation="Histogram of KV cache transfer size in MB.",
             labelnames=labels.keys(),
             buckets=(1, 5, 10, 50, 100, 500, 1000, 5000, 10000),
@@ -564,7 +565,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # Utilization
         # =================================================================
         self.utilization = Gauge(
-            name="sglang:utilization",
+            name=f"{METRICS_PREFIX}:utilization",
             documentation="The utilization.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
@@ -580,7 +581,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # Scheduler policy
         # =================================================================
         self.new_token_ratio = Gauge(
-            name="sglang:new_token_ratio",
+            name=f"{METRICS_PREFIX}:new_token_ratio",
             documentation="The new token ratio.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
@@ -591,13 +592,13 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # =================================================================
         # TODO maybe remove this old gauge in favor of the new counter
         self.is_cuda_graph = Gauge(
-            name="sglang:is_cuda_graph",
+            name=f"{METRICS_PREFIX}:is_cuda_graph",
             documentation="Whether the batch is using CUDA graph.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
         self.cuda_graph_passes_total = Counter(
-            name="sglang:cuda_graph_passes_total",
+            name=f"{METRICS_PREFIX}:cuda_graph_passes_total",
             documentation="Total number of forward passes categorized by CUDA graph.",
             labelnames=list(labels.keys()) + ["mode"],
         )
@@ -607,19 +608,19 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # =================================================================
         if self.enable_lora:
             self.lora_pool_slots_used = Gauge(
-                name="sglang:lora_pool_slots_used",
+                name=f"{METRICS_PREFIX}:lora_pool_slots_used",
                 documentation="Number of LoRA adapter slots currently occupied in GPU memory.",
                 labelnames=labels.keys(),
                 multiprocess_mode="mostrecent",
             )
             self.lora_pool_slots_total = Gauge(
-                name="sglang:lora_pool_slots_total",
+                name=f"{METRICS_PREFIX}:lora_pool_slots_total",
                 documentation="Total number of LoRA adapter slots available (max_loras_per_batch).",
                 labelnames=labels.keys(),
                 multiprocess_mode="mostrecent",
             )
             self.lora_pool_utilization = Gauge(
-                name="sglang:lora_pool_utilization",
+                name=f"{METRICS_PREFIX}:lora_pool_utilization",
                 documentation="LoRA pool utilization ratio (used/total). 1.0 means pool is full.",
                 labelnames=labels.keys(),
                 multiprocess_mode="mostrecent",
@@ -630,13 +631,13 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # =================================================================
         if self.enable_hierarchical_cache:
             self.hicache_host_used_tokens = Gauge(
-                name="sglang:hicache_host_used_tokens",
+                name=f"{METRICS_PREFIX}:hicache_host_used_tokens",
                 documentation="Number of tokens currently used in the host KV cache.",
                 labelnames=labels.keys(),
                 multiprocess_mode="mostrecent",
             )
             self.hicache_host_total_tokens = Gauge(
-                name="sglang:hicache_host_total_tokens",
+                name=f"{METRICS_PREFIX}:hicache_host_total_tokens",
                 documentation="Total capacity of the host KV cache in tokens.",
                 labelnames=labels.keys(),
                 multiprocess_mode="mostrecent",
@@ -647,13 +648,13 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # =================================================================
         if self.enable_streaming_session:
             self.num_streaming_sessions = Gauge(
-                name="sglang:num_streaming_sessions",
+                name=f"{METRICS_PREFIX}:num_streaming_sessions",
                 documentation="The number of streaming sessions.",
                 labelnames=labels.keys(),
                 multiprocess_mode="mostrecent",
             )
             self.streaming_session_held_tokens = Gauge(
-                name="sglang:streaming_session_held_tokens",
+                name=f"{METRICS_PREFIX}:streaming_session_held_tokens",
                 documentation="The number of KV tokens currently held by streaming session slots.",
                 labelnames=labels.keys(),
                 multiprocess_mode="mostrecent",
@@ -663,19 +664,19 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # Routing key metrics
         # =================================================================
         self.num_unique_running_routing_keys = Gauge(
-            name="sglang:num_unique_running_routing_keys",
+            name=f"{METRICS_PREFIX}:num_unique_running_routing_keys",
             documentation="Number of unique routing keys in running batch.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
         self.routing_key_running_req_count = GaugeHistogram(
-            name="sglang:routing_key_running_req_count",
+            name=f"{METRICS_PREFIX}:routing_key_running_req_count",
             documentation="Distribution of routing keys by running request count (gt < count <= le).",
             labelnames=list(labels.keys()),
             bucket_bounds=ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS,
         )
         self.routing_key_all_req_count = GaugeHistogram(
-            name="sglang:routing_key_all_req_count",
+            name=f"{METRICS_PREFIX}:routing_key_all_req_count",
             documentation="Distribution of routing keys by running+waiting request count (gt < count <= le).",
             labelnames=list(labels.keys()),
             bucket_bounds=ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS,
@@ -685,7 +686,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # Request latency
         # =================================================================
         self.queue_time = Histogram(
-            name="sglang:queue_time_seconds",
+            name=f"{METRICS_PREFIX}:queue_time_seconds",
             documentation="Histogram of queueing time in seconds.",
             labelnames=labels.keys(),
             buckets=[
@@ -732,7 +733,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             ],
         )
         self.per_stage_req_latency_seconds = Histogram(
-            name="sglang:per_stage_req_latency_seconds",
+            name=f"{METRICS_PREFIX}:per_stage_req_latency_seconds",
             documentation="The latency of each stage of requests.",
             # captures latency in range [1ms - ~1191s]
             buckets=exponential_buckets(start=0.001, width=1.62, length=30),
@@ -743,7 +744,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # Grammar
         # =================================================================
         self.grammar_compilation_time = Histogram(
-            name="sglang:grammar_compilation_time_seconds",
+            name=f"{METRICS_PREFIX}:grammar_compilation_time_seconds",
             documentation="Histogram of grammar compilation time in seconds.",
             labelnames=labels.keys(),
             buckets=[
@@ -767,27 +768,27 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             ],
         )
         self.num_grammar_cache_hit = Counter(
-            name="sglang:num_grammar_cache_hit_total",
+            name=f"{METRICS_PREFIX}:num_grammar_cache_hit_total",
             documentation="Number of grammar cache hits.",
             labelnames=labels.keys(),
         )
         self.num_grammar_aborted = Counter(
-            name="sglang:num_grammar_aborted_total",
+            name=f"{METRICS_PREFIX}:num_grammar_aborted_total",
             documentation="Number of grammar aborted requests.",
             labelnames=labels.keys(),
         )
         self.num_grammar_timeout = Counter(
-            name="sglang:num_grammar_timeout_total",
+            name=f"{METRICS_PREFIX}:num_grammar_timeout_total",
             documentation="Number of grammar timeouts.",
             labelnames=labels.keys(),
         )
         self.num_grammar_total = Counter(
-            name="sglang:num_grammar_total",
+            name=f"{METRICS_PREFIX}:num_grammar_total",
             documentation="Number of the total grammar requests.",
             labelnames=labels.keys(),
         )
         self.grammar_schema_count = Histogram(
-            name="sglang:grammar_schema_count",
+            name=f"{METRICS_PREFIX}:grammar_schema_count",
             documentation="Histogram of grammar schema count.",
             labelnames=labels.keys(),
             buckets=[
@@ -815,7 +816,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             ],
         )
         self.grammar_ebnf_size = Histogram(
-            name="sglang:grammar_ebnf_size",
+            name=f"{METRICS_PREFIX}:grammar_ebnf_size",
             documentation="Histogram of grammar EBNF size.",
             labelnames=labels.keys(),
             buckets=[
@@ -857,13 +858,13 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             240,
         ]
         self.grammar_tree_traversal_time_avg = Histogram(
-            name="sglang:grammar_tree_traversal_time_avg",
+            name=f"{METRICS_PREFIX}:grammar_tree_traversal_time_avg",
             documentation="Histogram of average grammar tree traversal time in seconds.",
             labelnames=labels.keys(),
             buckets=tree_traversal_time_buckets,
         )
         self.grammar_tree_traversal_time_max = Histogram(
-            name="sglang:grammar_tree_traversal_time_max",
+            name=f"{METRICS_PREFIX}:grammar_tree_traversal_time_max",
             documentation="Histogram of max grammar tree traversal time in seconds.",
             labelnames=labels.keys(),
             buckets=tree_traversal_time_buckets,
@@ -876,13 +877,13 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labels["moe_ep_rank"] == 0
         ) and envs.SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC.get():
             self.eplb_balancedness = Summary(
-                name="sglang:eplb_balancedness",
+                name=f"{METRICS_PREFIX}:eplb_balancedness",
                 documentation="Balancedness of MoE in expert parallelism.",
                 labelnames=list(labels.keys()) + ["forward_mode"],
             )
 
         self.realtime_tokens_total = Counter(
-            name="sglang:realtime_tokens_total",
+            name=f"{METRICS_PREFIX}:realtime_tokens_total",
             documentation=(
                 "Total number of tokens processed (updated on each log interval). "
                 "mode: prefill_compute, prefill_cache, decode."
@@ -890,7 +891,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=list(labels.keys()) + ["mode"],
         )
         self.forward_execution_seconds_total = Counter(
-            name="sglang:forward_execution_seconds_total",
+            name=f"{METRICS_PREFIX}:forward_execution_seconds_total",
             documentation=(
                 "Total time that GPU is busy executing model forward passes. "
                 "Refer to ForwardMode for category labels."
@@ -898,7 +899,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=list(labels.keys()) + ["category"],
         )
         self.estimated_flops_per_gpu_total = Counter(
-            name="sglang:estimated_flops_per_gpu_total",
+            name=f"{METRICS_PREFIX}:estimated_flops_per_gpu_total",
             documentation=(
                 "Estimated number of floating point operations per GPU "
                 "(for Model FLOPs Utilization calculations)."
@@ -906,7 +907,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
         self.estimated_read_bytes_per_gpu_total = Counter(
-            name="sglang:estimated_read_bytes_per_gpu_total",
+            name=f"{METRICS_PREFIX}:estimated_read_bytes_per_gpu_total",
             documentation=(
                 "Estimated number of bytes read from memory per GPU "
                 "(for Model FLOPs Utilization calculations)."
@@ -914,7 +915,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
         self.estimated_write_bytes_per_gpu_total = Counter(
-            name="sglang:estimated_write_bytes_per_gpu_total",
+            name=f"{METRICS_PREFIX}:estimated_write_bytes_per_gpu_total",
             documentation=(
                 "Estimated number of bytes written to memory per GPU "
                 "(for Model FLOPs Utilization calculations)."
@@ -923,7 +924,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
 
         self.dp_cooperation_realtime_tokens_total = Counter(
-            name="sglang:dp_cooperation_realtime_tokens_total",
+            name=f"{METRICS_PREFIX}:dp_cooperation_realtime_tokens_total",
             documentation=(
                 "Total number of tokens processed with labels about DP cooperation. "
                 "mode: prefill_compute, prefill_cache, decode."
@@ -931,7 +932,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=list(labels.keys()) + ["mode", "num_prefill_ranks"],
         )
         self.dp_cooperation_forward_execution_seconds_total = Counter(
-            name="sglang:dp_cooperation_forward_execution_seconds_total",
+            name=f"{METRICS_PREFIX}:dp_cooperation_forward_execution_seconds_total",
             documentation=(
                 "Total time that GPU is busy executing model forward passes, "
                 "with labels about DP cooperation. "
@@ -945,7 +946,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # =================================================================
         max_delay = server_args.prefill_delayer_max_delay_passes
         self.prefill_delayer_wait_forward_passes = Histogram(
-            name="sglang:prefill_delayer_wait_forward_passes",
+            name=f"{METRICS_PREFIX}:prefill_delayer_wait_forward_passes",
             documentation="Histogram of forward passes waited by prefill delayer.",
             labelnames=labels.keys(),
             buckets=sorted(
@@ -962,7 +963,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             ),
         )
         self.prefill_delayer_wait_seconds = Histogram(
-            name="sglang:prefill_delayer_wait_seconds",
+            name=f"{METRICS_PREFIX}:prefill_delayer_wait_seconds",
             documentation="Histogram of wait time in seconds by prefill delayer.",
             labelnames=labels.keys(),
             buckets=sorted(
@@ -975,7 +976,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             ),
         )
         self.prefill_delayer_outcomes_total = Counter(
-            name="sglang:prefill_delayer_outcomes_total",
+            name=f"{METRICS_PREFIX}:prefill_delayer_outcomes_total",
             documentation="Prefill delayer outcome counts.",
             labelnames=[
                 *labels.keys(),
@@ -990,61 +991,76 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # Constants (set once at startup via emit_constants)
         # =================================================================
         self.max_total_num_tokens = Gauge(
-            name="sglang:max_total_num_tokens",
+            name=f"{METRICS_PREFIX}:max_total_num_tokens",
             documentation="Maximum total number of tokens in the KV cache pool.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
         self.max_total_num_tokens_swa = Gauge(
-            name="sglang:max_total_num_tokens_swa",
+            name=f"{METRICS_PREFIX}:max_total_num_tokens_swa",
             documentation="Maximum total number of tokens in the SWA KV cache pool.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
         self.weight_memory_usage_gb = Gauge(
-            name="sglang:weight_memory_usage_gb",
+            name=f"{METRICS_PREFIX}:weight_memory_usage_gb",
             documentation="Memory used by model weights in GB.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
         self.kv_cache_memory_usage_gb = Gauge(
-            name="sglang:kv_cache_memory_usage_gb",
+            name=f"{METRICS_PREFIX}:kv_cache_memory_usage_gb",
             documentation="Memory used by the KV cache pools in GB.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
         self.graph_memory_usage_gb = Gauge(
-            name="sglang:graph_memory_usage_gb",
+            name=f"{METRICS_PREFIX}:graph_memory_usage_gb",
             documentation="Memory used by captured device graphs in GB.",
             labelnames=list(labels.keys()) + ["phase"],
             multiprocess_mode="mostrecent",
         )
         self.max_running_requests_under_SLO = Gauge(
-            name="sglang:max_running_requests_under_SLO",
+            name=f"{METRICS_PREFIX}:max_running_requests_under_SLO",
             documentation="The maximum number of running requests under SLO.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.engine_startup_time = Gauge(
+            name=f"{METRICS_PREFIX}:engine_startup_time",
+            documentation="The time taken for the engine to start up.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.engine_load_weights_time = Gauge(
+            name=f"{METRICS_PREFIX}:engine_load_weights_time",
+            documentation="The time taken for the engine to load weights.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
         self.page_size = Gauge(
-            name="sglang:page_size",
+            name=f"{METRICS_PREFIX}:page_size",
             documentation="KV cache page size in tokens.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
         self.num_pages = Gauge(
-            name="sglang:num_pages",
+            name=f"{METRICS_PREFIX}:num_pages",
             documentation="Number of KV cache pages.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
         self.context_len = Gauge(
-            name="sglang:context_len",
+            name=f"{METRICS_PREFIX}:context_len",
             documentation="Maximum context length.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
         self.startup_available_gpu_memory_gb = Gauge(
-            name="sglang:startup_available_gpu_memory_gb",
+            name=f"{METRICS_PREFIX}:startup_available_gpu_memory_gb",
             documentation="Available GPU memory in GB at startup.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
@@ -1479,12 +1495,12 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         )
 
         self.prompt_tokens_total = Counter(
-            name="sglang:prompt_tokens_total",
+            name=f"{METRICS_PREFIX}:prompt_tokens_total",
             documentation="Number of prefill tokens processed.",
             labelnames=list(labels.keys()) + ["is_streaming"],
         )
         self.generation_tokens_total = Counter(
-            name="sglang:generation_tokens_total",
+            name=f"{METRICS_PREFIX}:generation_tokens_total",
             documentation="Number of generation tokens processed.",
             labelnames=list(labels.keys()) + ["is_streaming"],
         )
@@ -1532,7 +1548,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             1100000,
         ]
         self.prompt_tokens_histogram = Histogram(
-            name="sglang:prompt_tokens_histogram",
+            name=f"{METRICS_PREFIX}:prompt_tokens_histogram",
             documentation="Histogram of prompt token length.",
             labelnames=labels.keys(),
             buckets=generate_buckets(
@@ -1548,7 +1564,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             ),
         )
         self.generation_tokens_histogram = Histogram(
-            name="sglang:generation_tokens_histogram",
+            name=f"{METRICS_PREFIX}:generation_tokens_histogram",
             documentation="Histogram of generation token length.",
             labelnames=labels.keys(),
             buckets=generate_buckets(
@@ -1558,13 +1574,13 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         )
 
         self.cached_tokens_total = Counter(
-            name="sglang:cached_tokens_total",
+            name=f"{METRICS_PREFIX}:cached_tokens_total",
             documentation="Number of cached prompt tokens by source (device/host/storage).",
             labelnames=list(labels.keys()) + ["cache_source"],
         )
 
         self.num_requests_total = Counter(
-            name="sglang:num_requests_total",
+            name=f"{METRICS_PREFIX}:num_requests_total",
             documentation="Number of requests processed.",
             labelnames=list(labels.keys()) + ["is_streaming"],
         )
@@ -1577,13 +1593,13 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         )
 
         self.num_so_requests_total = Counter(
-            name="sglang:num_so_requests_total",
+            name=f"{METRICS_PREFIX}:num_so_requests_total",
             documentation="Number of structured output requests processed.",
             labelnames=labels.keys(),
         )
 
         self.num_aborted_requests_total = Counter(
-            name="sglang:num_aborted_requests_total",
+            name=f"{METRICS_PREFIX}:num_aborted_requests_total",
             documentation="Number of requests aborted.",
             labelnames=labels.keys(),
         )
@@ -1664,7 +1680,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             ]
 
         self.histogram_time_to_first_token = Histogram(
-            name="sglang:time_to_first_token_seconds",
+            name=f"{METRICS_PREFIX}:time_to_first_token_seconds",
             documentation="Histogram of time to first token in seconds.",
             # "is_streaming" splits streaming vs non-streaming requests (named to
             # match downstream storage dimensions exactly - "stream" is a
@@ -1674,14 +1690,14 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         )
 
         self.histogram_inter_token_latency = Histogram(
-            name="sglang:inter_token_latency_seconds",
+            name=f"{METRICS_PREFIX}:inter_token_latency_seconds",
             documentation="Histogram of inter-token latency in seconds.",
             labelnames=labels.keys(),
             buckets=bucket_inter_token_latency,
         )
 
         self.histogram_e2e_request_latency = Histogram(
-            name="sglang:e2e_request_latency_seconds",
+            name=f"{METRICS_PREFIX}:e2e_request_latency_seconds",
             documentation="Histogram of End-to-end request latency in seconds",
             labelnames=list(labels.keys()) + ["is_streaming"],
             buckets=bucket_e2e_request_latency,
@@ -1828,13 +1844,13 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
         self.labels = labels
 
         self.prefetched_tokens_total = Counter(
-            name="sglang:prefetched_tokens_total",
+            name=f"{METRICS_PREFIX}:prefetched_tokens_total",
             documentation="Number of prefetched prompt tokens.",
             labelnames=labels.keys(),
         )
 
         self.backuped_tokens_total = Counter(
-            name="sglang:backuped_tokens_total",
+            name=f"{METRICS_PREFIX}:backuped_tokens_total",
             documentation="Number of backuped tokens.",
             labelnames=labels.keys(),
         )
@@ -1858,28 +1874,28 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
         ]
 
         self.histogram_prefetch_pgs = Histogram(
-            name="sglang:prefetch_pgs",
+            name=f"{METRICS_PREFIX}:prefetch_pgs",
             documentation="Histogram of prefetch pages of batches.",
             labelnames=labels.keys(),
             buckets=bucket_io,
         )
 
         self.histogram_backup_pgs = Histogram(
-            name="sglang:backup_pgs",
+            name=f"{METRICS_PREFIX}:backup_pgs",
             documentation="Histogram of backup pages of batches.",
             labelnames=labels.keys(),
             buckets=bucket_io,
         )
 
         self.histogram_prefetch_bandwidth = Histogram(
-            name="sglang:prefetch_bandwidth",
+            name=f"{METRICS_PREFIX}:prefetch_bandwidth",
             documentation="Histogram of prefetch bandwidth in GB/s.",
             labelnames=labels.keys(),
             buckets=bucket_bandwidth,
         )
 
         self.histogram_backup_bandwidth = Histogram(
-            name="sglang:backup_bandwidth",
+            name=f"{METRICS_PREFIX}:backup_bandwidth",
             documentation="Histogram of backup bandwidth in GB/s.",
             labelnames=labels.keys(),
             buckets=bucket_bandwidth,
@@ -1920,7 +1936,7 @@ class ExpertDispatchCollector(_StatLoggerDIMixin):
 
         ep_size_buckets = [i for i in range(ep_size)]
         self.eplb_gpu_physical_count = Histogram(
-            name="sglang:eplb_gpu_physical_count",
+            name=f"{METRICS_PREFIX}:eplb_gpu_physical_count",
             documentation="The selected count of physical experts on each layer and GPU rank.",
             labelnames={"layer"},
             buckets=ep_size_buckets,
@@ -1990,27 +2006,27 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
                 1.0,
             ]
         self.eviction_duration_seconds = Histogram(
-            name="sglang:eviction_duration_seconds",
+            name=f"{METRICS_PREFIX}:eviction_duration_seconds",
             documentation="Time taken to evict memory from GPU to CPU in seconds.",
             labelnames=labels.keys(),
             buckets=bucket_eviction_duration,
         )
 
         self.eviction_num_tokens = Counter(
-            name="sglang:evicted_tokens_total",
+            name=f"{METRICS_PREFIX}:evicted_tokens_total",
             documentation="The number of tokens evicted from GPU to CPU.",
             labelnames=labels.keys(),
         )
 
         self.load_back_duration_seconds = Histogram(
-            name="sglang:load_back_duration_seconds",
+            name=f"{METRICS_PREFIX}:load_back_duration_seconds",
             documentation="Time taken to load KV cache from CPU back to GPU in seconds.",
             labelnames=labels.keys(),
             buckets=bucket_load_back_duration,
         )
 
         self.load_back_num_tokens = Counter(
-            name="sglang:load_back_tokens_total",
+            name=f"{METRICS_PREFIX}:load_back_tokens_total",
             documentation="The number of tokens loaded from CPU to GPU.",
             labelnames=labels.keys(),
         )

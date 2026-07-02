@@ -1058,6 +1058,9 @@ class Envs:
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
     SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
 
+    # DP Attention
+    SGLANG_DP_ATTN_COMPRESSED_ALLGATHER = EnvBool(False)
+
     # Tokenizer (Kimi tiktoken: cache all_special_tokens / all_special_ids; the ITL can differ by +10x under high batch size).
     SGLANG_PATCH_TOKENIZER = EnvBool(True)
 
@@ -1343,6 +1346,10 @@ class Envs:
     SGLANG_RUST_SERVER = EnvBool(False)
     # Most batched requests one /generate HTTP call may expand into.
     SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ = EnvInt(4096)
+
+    # openai server
+    JD_ENABLE_IGNORE_EOS = EnvBool(False)
+    JD_DEFAULT_MAX_TOKENS = EnvInt(8192)
 
 
 envs = Envs()
