@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
+_ENABLE_COMPRESSED_ALLGATHER = envs.SGLANG_DP_ATTN_COMPRESSED_ALLGATHER.get()
 
 
 def _resolve_elastic_world_dp_size(
@@ -98,35 +99,63 @@ class MLPSyncBatchInfo:
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
 
-    def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
-        return torch.tensor(
-            [
-                self.num_tokens,
-                self.num_tokens_for_logprob,
-                int(self.can_run_decode_cuda_graph),
-                int(self.is_extend_in_batch),
-                int(self.local_can_run_tbo),
-                self.local_forward_mode,
-                int(self.can_run_prefill_cuda_graph),
-            ],
-            device=device,
-            dtype=dtype,
-        )
+    def _get_local_tensor(self, device, dtype=None) -> torch.Tensor:
+        if _ENABLE_COMPRESSED_ALLGATHER:
+            return torch.tensor(
+                [
+                    int(self.num_tokens),
+                    int(self.num_tokens_for_logprob),
+                    (int(self.can_run_decode_cuda_graph) << 0)
+                    | (int(self.is_extend_in_batch) << 1)
+                    | (int(self.local_can_run_tbo) << 2),
+                    int(self.local_forward_mode),
+                    int(self.can_run_prefill_cuda_graph),
+                ],
+                device=device,
+                dtype=torch.int32,
+            )
+        else:
+            return torch.tensor(
+                [
+                    self.num_tokens,
+                    self.num_tokens_for_logprob,
+                    int(self.can_run_decode_cuda_graph),
+                    int(self.is_extend_in_batch),
+                    int(self.local_can_run_tbo),
+                    self.local_forward_mode,
+                    int(self.can_run_prefill_cuda_graph),
+                ],
+                device=device,
+                dtype=torch.int64,
+            )
 
-    def _get_fallback_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
-        return torch.tensor(
-            [
-                0,  # num_tokens
-                0,  # num_tokens_for_logprob
-                1,  # can_run_decode_cuda_graph
-                0,  # is_extend_in_batch
-                1,  # local_can_run_tbo
-                ForwardMode.IDLE.value,  # local_forward_mode
-                0,  # can_run_prefill_cuda_graph
-            ],
-            device=device,
-            dtype=dtype,
-        )
+    def _get_fallback_tensor(self, device, dtype=None) -> torch.Tensor:
+        if _ENABLE_COMPRESSED_ALLGATHER:
+            return torch.tensor(
+                [
+                    0,
+                    0,
+                    (1 << 0) | (0 << 1) | (1 << 2),
+                    ForwardMode.IDLE.value,
+                    0,
+                ],
+                device=device,
+                dtype=torch.int32,
+            )
+        else:
+            return torch.tensor(
+                [
+                    0,
+                    0,
+                    1,
+                    0,
+                    1,
+                    ForwardMode.IDLE.value,
+                    0,
+                ],
+                device=device,
+                dtype=torch.int64,
+            )
 
     def all_gather(
         self,
@@ -179,7 +208,23 @@ class MLPSyncBatchInfo:
             )
         tp_info[tp_active_ranks[:num_ranks_in_tp_info] == 0] = fallback_tensor
 
-        tp0_info = global_info_tensor[:, 0, :]
+        tp0_wire_info = global_info_tensor[:, 0, :]
+        if _ENABLE_COMPRESSED_ALLGATHER:
+            tp0_info = torch.zeros(
+                (self.dp_size, 7), dtype=torch.int64, device=device
+            )
+            tp0_info[:, 0] = tp0_wire_info[:, 0].to(torch.int64)
+            tp0_info[:, 1] = tp0_wire_info[:, 1].to(torch.int64)
+
+            flags = tp0_wire_info[:, 2]
+            tp0_info[:, 2] = (flags & 0b001).ne(0).to(torch.int64)
+            tp0_info[:, 3] = (flags & 0b010).ne(0).to(torch.int64)
+            tp0_info[:, 4] = (flags & 0b100).ne(0).to(torch.int64)
+            tp0_info[:, 5] = tp0_wire_info[:, 3].to(torch.int64)
+            tp0_info[:, 6] = tp0_wire_info[:, 4].to(torch.int64)
+        else:
+            tp0_info = tp0_wire_info
+
         self.tp0_info = tp0_info
         # Perform only one Device-to-Host (D2H) memory copy
         cpu_data = tp0_info[:, :2].cpu()
