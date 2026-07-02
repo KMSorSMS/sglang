@@ -2701,6 +2701,14 @@ class ServerArgs:
         "Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically.",
         NS("mm"),
     ] = False
+    mm_max_concurrent_calls: A[
+        int,
+        "The max concurrent calls for async mm data processing.",
+    ] = 32
+    mm_per_request_timeout: A[
+        float,
+        "The timeout for each multi-modal request in seconds.",
+    ] = 10.0
     mm_process_config: A[
         Optional[Dict[str, Any]],
         Arg(

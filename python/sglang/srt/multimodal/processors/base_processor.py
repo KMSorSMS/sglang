@@ -1,10 +1,12 @@
 import asyncio
 import concurrent
 import concurrent.futures
+import gc
 import dataclasses
 import multiprocessing as mp
 import os
 import re
+import traceback
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
@@ -580,12 +582,31 @@ class BaseMultimodalProcessor(ABC):
             if bos and input_text.startswith(bos):
                 kwargs.setdefault("add_special_tokens", False)
 
-        result = processor.__call__(
-            text=[input_text],
-            padding=True,
-            return_tensors="pt",
-            **kwargs,
-        )
+        try:
+            result = processor.__call__(
+                text=[input_text],
+                padding=True,
+                return_tensors="pt",
+                **kwargs,
+            )
+        except Exception as exc:
+            oom_error_type = getattr(torch, "OutOfMemoryError", None)
+            if torch.cuda.is_available() and (
+                (oom_error_type is not None and isinstance(exc, oom_error_type))
+                or "out of memory" in str(exc).lower()
+            ):
+                # The fast image processor can leave large CUDA allocations cached
+                # when preprocessing fails mid-flight. Clear the cache so the
+                # server can recover immediately after the request aborts.
+                if exc.__traceback__ is not None:
+                    traceback.clear_frames(exc.__traceback__)
+                gc.collect()
+                torch.cuda.empty_cache()
+                raise ValueError(
+                    "Multimodal preprocessing ran out of GPU memory. "
+                    "Please reduce the number or resolution of image/video inputs."
+                ) from None
+            raise
         # Deferred: the hash is computed on the GPU tensor first, and
         # _precompute_hashes_before_cpu_transfer moves it down afterwards.
         if not self.use_cuda_ipc and not self.precompute_hash_before_cpu_transfer:
@@ -1048,7 +1069,7 @@ class BaseMultimodalProcessor(ABC):
                     modality.name,
                     idx,
                 )
-                raise RuntimeError(
+                raise ValueError(
                     f"An exception occurred while loading {modality.name} data at index {idx}: {e}"
                 )
 
@@ -1180,7 +1201,7 @@ class BaseMultimodalProcessor(ABC):
                 if has_precomputed_input:
                     new_text_parts += [text_part]
                     continue
-                raise RuntimeError(
+                raise ValueError(
                     f"An exception occurred while loading multimodal data: {e}"
                 )
             except ValueError as e:
@@ -1188,7 +1209,7 @@ class BaseMultimodalProcessor(ABC):
                     f"An exception occurred while loading multimodal data: {e}"
                 ) from e
             except Exception as e:
-                raise RuntimeError(
+                raise ValueError(
                     f"An exception occurred while loading multimodal data: {e}"
                 )
         return BaseMultiModalProcessorOutput(
