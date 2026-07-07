@@ -262,6 +262,36 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         tens of seconds (see HostKVCache.destroy). Idempotent.
         """
 
+    def observe_l1_residency(self, tier_enter_time: float) -> None:
+        if self.metrics_collector is not None and tier_enter_time > 0.0:
+            self.metrics_collector.observe_l1_residency(
+                max(0.0, time.monotonic() - tier_enter_time)
+            )
+
+    def observe_l2_residency(self, tier_enter_time: float) -> None:
+        if self.metrics_collector is not None and tier_enter_time > 0.0:
+            self.metrics_collector.observe_l2_residency(
+                max(0.0, time.monotonic() - tier_enter_time)
+            )
+
+    def mark_l1_tier_enter(self, node) -> None:
+        if node.l1_tier_enter_time == 0.0:
+            node.l1_tier_enter_time = time.monotonic()
+
+    def finish_l1_tier_stay(self, node) -> None:
+        if node.l1_tier_enter_time > 0.0:
+            self.observe_l1_residency(node.l1_tier_enter_time)
+            node.l1_tier_enter_time = 0.0
+
+    def mark_l2_tier_enter(self, node) -> None:
+        if node.l2_tier_enter_time == 0.0:
+            node.l2_tier_enter_time = time.monotonic()
+
+    def finish_l2_tier_stay(self, node) -> None:
+        if node.l2_tier_enter_time > 0.0:
+            self.observe_l2_residency(node.l2_tier_enter_time)
+            node.l2_tier_enter_time = 0.0
+
     @abstractmethod
     def reset(self):
         pass

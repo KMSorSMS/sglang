@@ -403,6 +403,7 @@ class FullComponent(TreeComponent):
         if phase == CacheTransferPhase.BACKUP_HOST:
             if transfers and transfers[0].host_indices is not None:
                 node.component_data[ct].host_value = transfers[0].host_indices.clone()
+                self.cache.mark_l2_tier_enter(node)
 
         elif phase == CacheTransferPhase.LOAD_BACK:
             if not transfers or transfers[0].device_indices is None:
@@ -421,6 +422,7 @@ class FullComponent(TreeComponent):
                 # Full uses leaf sets, not LRU
                 self.tree_core.component_evictable_size_[ct] += n_len
                 self.tree_core._update_evictable_leaf_sets(n)
+                self.cache.mark_l1_tier_enter(n)
 
             self.tree_core._update_evictable_leaf_sets(node)
 

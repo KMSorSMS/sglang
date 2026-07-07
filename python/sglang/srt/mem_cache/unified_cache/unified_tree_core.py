@@ -122,7 +122,10 @@ class UnifiedTreeNode:
         )
         self.id = UnifiedTreeNode.counter
         UnifiedTreeNode.counter += 1
-        self.write_through_pending_id: Optional[int] = None
+       self.write_through_pending_id: Optional[int] = None
+        # Tier enter timestamps for L1/L2 residency metrics (0 = not on tier).
+        self.l1_tier_enter_time: float = 0.0
+        self.l2_tier_enter_time: float = 0.0
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
