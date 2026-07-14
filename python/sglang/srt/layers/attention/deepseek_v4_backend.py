@@ -1102,7 +1102,8 @@ class DeepseekV4AttnBackend(
                     raw_metadata=self.forward_metadata,
                     online_c128_state_slot_offset=online_c128_state_slot_offset,
                 )
-                full_buf.copy_(temp)
+                with torch.inference_mode():
+                    full_buf.copy_(temp)
                 self.forward_metadata = full_buf
             else:
                 self.forward_metadata = self.make_forward_metadata_from_raw_verify(
@@ -1115,7 +1116,8 @@ class DeepseekV4AttnBackend(
                 temp = self.make_forward_metadata_from_raw_decode(
                     raw_metadata=self.forward_metadata,
                 )
-                full_buf.copy_(temp)
+                with torch.inference_mode():
+                    full_buf.copy_(temp)
                 self.forward_metadata = full_buf
             else:
                 self.forward_metadata = self.make_forward_metadata_from_raw_decode(
