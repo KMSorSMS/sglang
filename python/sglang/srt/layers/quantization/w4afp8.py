@@ -325,6 +325,20 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         )
         layer.w2_input_scale = Parameter(new_w2_input_scale, requires_grad=False)
 
+        # W4AFp8 cutlass G4A8 GEMM2 outputs BF16, and DeepEP's normal combine
+        # kernel is dtype-coupled to the dispatch dtype: FP8 dispatch makes
+        # combine reject the BF16 expert output ('Unsupported type' in
+        # intranode_combine). So dispatch must stay BF16. The per-tensor
+        # dynamic quant then runs on the BF16 a_states in the MoE core.
+        if hasattr(layer, "dispatcher") and layer.dispatcher is not None:
+            layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
+
+        # Pre-compute whether input_scale is valid (not default 1.0)
+        # 1.0 means uncalibrated → use dynamic quantization
+        w13_val = layer.w13_input_scale.detach().cpu().item()
+        w2_val = layer.w2_input_scale.detach().cpu().item()
+        layer._has_static_input_scale = w13_val != 1.0 and w2_val != 1.0
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -399,8 +413,17 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             layer.quant_method.expert_offsets,
             layer.quant_method.problem_sizes1,
             layer.quant_method.problem_sizes2,
-            layer.w13_input_scale,
-            layer.w2_input_scale,
+            # Use static quantization with calibrated input scales; otherwise dynamic.
+            (
+                layer.w13_input_scale
+                if getattr(layer, "_has_static_input_scale", False)
+                else None
+            ),
+            (
+                layer.w2_input_scale
+                if getattr(layer, "_has_static_input_scale", False)
+                else None
+            ),
             group_size=self.quant_config.group_size,
         )
 
