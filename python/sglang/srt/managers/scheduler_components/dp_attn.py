@@ -219,9 +219,9 @@ class MLPSyncBatchInfo:
             cpu_data = tp0_wire_info[:, :2].cpu()
             self.global_num_tokens = cpu_data[:, 0].tolist()
             self.global_num_tokens_for_logprob = cpu_data[:, 1].tolist()
-            self.can_cuda_graph = bool((flags & 0b001).ne(0).min().item())
+            self.can_run_decode_cuda_graph = bool((flags & 0b001).ne(0).min().item())
             self.is_extend_in_batch = bool((flags & 0b010).ne(0).max().item())
-            self.can_run_breakable_cuda_graph = bool(
+            self.can_run_prefill_cuda_graph = bool(
                 tp0_wire_info[:, 4].min().item()
             )
             if _ENABLE_METRICS_DP_ATTENTION:
