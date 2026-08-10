@@ -2041,7 +2041,7 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             documentation="The number of tokens loaded from CPU to GPU.",
             labelnames=labels.keys(),
         )
-   
+
         # Tier dwell = wall-clock from KV placed on device/host until that tier evicts.
         bucket_residency = get_histogram_conf_from_env(
             "SGLANG_BUCKET_RESIDENCY_SECONDS"

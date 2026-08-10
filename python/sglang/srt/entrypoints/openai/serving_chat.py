@@ -2031,9 +2031,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     return ToolCallProcessingResult(tool_calls, text, finish_reason)
                 except Exception as e:
                     logger.error(f"Tool call parsing error: {e}")
-                    return ToolCallProcessingResult(
-                        None, text, original_finish_reason
-                    )
+                    return ToolCallProcessingResult(None, text, original_finish_reason)
 
         # json_schema constraint → JSON array output for required/named
         if is_required:
@@ -2283,6 +2281,65 @@ class OpenAIServingChat(OpenAIServingBase):
         if not self.reasoning_parser:
             return False
 
+        if self.reasoning_parser == "gemma4":
+            return (
+                request.chat_template_kwargs is not None
+                and request.chat_template_kwargs.get("enable_thinking") is True
+            )
+        if self.reasoning_parser in [
+            "glm45",
+            "deepseek-v3",
+            "deepseek-v4",
+            "qwen3",
+            "nemotron_3",
+            "interns1",
+            "kimi_k2",
+        ]:
+            # Models that support thinking switches with parser-specific defaults.
+            kwargs = request.chat_template_kwargs or {}
+            thinking = kwargs.get("thinking")
+            if isinstance(thinking, str):
+                thinking = thinking.strip().lower()
+            if kwargs.get("enable_thinking") is True or thinking in [
+                True,
+                "enabled",
+            ]:
+                return True
+            if kwargs.get("enable_thinking") is False or thinking in [
+                False,
+                "disabled",
+            ]:
+                return False
+
+            # Fallback to protocol.py top-level thinking field.
+            if thinking is None:
+                top_thinking = getattr(request, "thinking", None)
+                if isinstance(top_thinking, bool):
+                    thinking = top_thinking
+                elif isinstance(top_thinking, str):
+                    thinking = top_thinking.strip().lower()
+                elif isinstance(top_thinking, dict):
+                    thinking_type = top_thinking.get("type")
+                    if isinstance(thinking_type, str):
+                        thinking_type = thinking_type.strip().lower()
+                    if thinking_type == "enabled":
+                        return True
+                    if thinking_type == "disabled":
+                        return False
+            return self.reasoning_parser not in ("deepseek-v3", "deepseek-v4")
+
+        if self.reasoning_parser == "nano_v3":
+            return request.chat_template_kwargs is not None and (
+                request.chat_template_kwargs.get("thinking")
+                or request.chat_template_kwargs.get("enable_thinking")
+            )
+        if self.reasoning_parser == "mimo":
+            # MiMo requires thinking to be enabled explicitly.
+            return (
+                request.chat_template_kwargs is not None
+                and request.chat_template_kwargs.get("enable_thinking") is True
+            )
+
         if self.reasoning_parser == "minimax-m3":
             # M3 template prefills <mm:think> for thinking_mode=enabled, so it never
             # appears in output and reasoning must be forced. Mirrors reasoning_parser.py.
@@ -2316,7 +2373,9 @@ class OpenAIServingChat(OpenAIServingBase):
         """
         think = False
         if hasattr(request, "chat_template_kwargs") and request.chat_template_kwargs:
-            think = request.chat_template_kwargs.get("enable_thinking", False) or request.chat_template_kwargs.get("thinking", False)
+            think = request.chat_template_kwargs.get(
+                "enable_thinking", False
+            ) or request.chat_template_kwargs.get("thinking", False)
 
         # Fallback to protocol.py top-level thinking field
         if not think:
