@@ -1038,9 +1038,6 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
-        )
         self.page_size = Gauge(
             name=f"{METRICS_PREFIX}:page_size",
             documentation="KV cache page size in tokens.",
