@@ -145,6 +145,9 @@ class TestSglKernelFlashAttentionConfig(CustomTestCase):
     def test_wheel_cache_metadata_binds_exact_artifact_and_source_tree(self):
         script = BUILD_SCRIPT.read_text(encoding="utf-8")
 
+        # build_info.txt 仍写入 SOURCE_COMMIT/SOURCE_BRANCH 作为审计元数据，
+        # 但 merge 模式 provenance 校验只看内容决定因子（KERNEL_TREE + 环境），
+        # 不再校验 SOURCE_BRANCH/SOURCE_COMMIT——开发分支 -r 产的 wheel 能被主分支 -m 复用。
         for expected in (
             'CACHE_BUILD_INFO="${WHEEL_CACHE_DIR}/build_info.txt"',
             'SOURCE_COMMIT=$(git rev-parse HEAD)',
@@ -155,15 +158,18 @@ class TestSglKernelFlashAttentionConfig(CustomTestCase):
             'SOURCE_BRANCH=${SOURCE_BRANCH}',
             'KERNEL_TREE=${KERNEL_TREE}',
             'WHEEL_SHA256=${WHEEL_SHA256}',
-            'EXPECTED_CACHE_BRANCH="JD-${BASE_IMAGE_TAG}"',
-            'EXPECTED_RELEASE_SOURCE_COMMIT="${SGL_KERNEL_EXPECTED_SOURCE_COMMIT:-}"',
             'EXPECTED_RELEASE_TREE="${SGL_KERNEL_EXPECTED_TREE:-}"',
             'cached SGL-Kernel wheel sha256 mismatch',
-            'CACHED_SOURCE_COMMIT}" != "${EXPECTED_RELEASE_SOURCE_COMMIT}',
             'CACHED_KERNEL_TREE}" != "${EXPECTED_RELEASE_TREE}',
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, script)
+        # SOURCE_BRANCH/SOURCE_COMMIT 不再参与 merge 模式校验
+        self.assertNotIn('EXPECTED_CACHE_BRANCH', script)
+        self.assertNotIn(
+            'CACHED_SOURCE_COMMIT}" != "${EXPECTED_RELEASE_SOURCE_COMMIT}',
+            script,
+        )
         self.assertIn('CACHED="${WHEEL_CACHE_DIR}/${CACHED_WHEEL_NAME}"', script)
         self.assertNotIn('CACHED=$(ls -t "${WHEEL_CACHE_DIR}"', script)
 

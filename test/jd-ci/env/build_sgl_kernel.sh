@@ -228,7 +228,6 @@ VERSION=$(awk -F'"' '/^__version__/{print $2}' "${KERNEL_DIR}/python/sgl_kernel/
 SOURCE_COMMIT=$(git rev-parse HEAD)
 SOURCE_BRANCH=$(git branch --show-current)
 KERNEL_TREE=$(git rev-parse HEAD:python/sglang/kernels/aot)
-EXPECTED_CACHE_BRANCH="JD-${BASE_IMAGE_TAG}"
 EXPECTED_RELEASE_SOURCE_COMMIT="${SGL_KERNEL_EXPECTED_SOURCE_COMMIT:-}"
 EXPECTED_RELEASE_TREE="${SGL_KERNEL_EXPECTED_TREE:-}"
 mkdir -p "${WHEEL_CACHE_DIR}"
@@ -315,21 +314,16 @@ if [[ "${EVENT_TYPE}" == "merge_request__merged" ]]; then
         echo "[SGLang CI] ERROR: SGL-Kernel wheel cache miss: ${WHEEL_CACHE_DIR}" >&2
         exit 1
     fi
-    if [[ "${CACHED_SOURCE_BRANCH}" != "${EXPECTED_CACHE_BRANCH}" \
-        || "${CACHED_SOURCE_COMMIT}" != "${EXPECTED_RELEASE_SOURCE_COMMIT}" \
-        || "${CACHED_KERNEL_TREE}" != "${EXPECTED_RELEASE_TREE}" \
+    # 校验内容决定因子：代码树 + 环境一致性。
+    # SOURCE_BRANCH/SOURCE_COMMIT 仅作审计元数据记录，不参与校验——两个不同的 sglang
+    # 分支只要 sgl-kernel 代码树(KERNEL_TREE)一致，产出的 wheel 就完全一样可以互换。
+    # 这样开发分支 -r 产的 wheel 能被主分支 -m 复用。
+    if [[ "${CACHED_KERNEL_TREE}" != "${EXPECTED_RELEASE_TREE}" \
         || "${CACHED_BASE_IMAGE_TAG}" != "${BASE_IMAGE_TAG}" \
         || "${CACHED_CUDA}" != "${CUDA_TOOLKIT_VERSION}" \
         || "${CACHED_ARCHS}" != "${TARGET_ARCHS}" \
         || "${CACHED_DEPS_SHA256}" != "${FETCHCONTENT_REVISIONS_SHA256}" ]]; then
         echo "[SGLang CI] ERROR: SGL-Kernel cache provenance mismatch: ${CACHE_BUILD_INFO}" >&2
-        exit 1
-    fi
-    if [[ "$(git rev-parse "${CACHED_SOURCE_COMMIT}^{commit}" 2>/dev/null || true)" \
-        != "${CACHED_SOURCE_COMMIT}" \
-        || "$(git rev-parse "${CACHED_SOURCE_COMMIT}:python/sglang/kernels/aot" 2>/dev/null || true)" \
-        != "${CACHED_KERNEL_TREE}" ]]; then
-        echo "[SGLang CI] ERROR: cached SGL-Kernel source commit/tree cannot be verified" >&2
         exit 1
     fi
     WHEEL_SHA256=$(sha256sum "${CACHED}" | awk '{print $1}')

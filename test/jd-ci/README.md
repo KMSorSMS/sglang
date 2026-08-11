@@ -423,17 +423,18 @@ v0.5.16 prerequisite 审计固定记录以下解析结果：
 | FlashMLA | `05e26647fe840b8baedae486c2d86d5ce4efeb7c` |
 | FlashMLA CUTLASS | `147f5673d0c1c3dcf66f78d677fd647e4a020219` |
 | HPC-Ops | 默认使用源码 checkout 当前 `HEAD`；可通过 `HPC_OPS_EXPECTED_REVISION` 显式固定 |
-| Mooncake TE | `JD-v0.3.11.post1`，审计时 branch HEAD `ff4255735425d7d1f1d5a367d0978d60ce2771f7` |
+| Mooncake TE | 从 JD-v0.5.17 起使用本地预置源码树，按基础镜像 `pip list` 的 mooncake-transfer-engine 版本分桶；`build_mooncake.sh` 校验 `mooncake-wheel/pyproject.toml` version 与基础镜像版本一致 |
 
 SGL-Kernel 构建日志从实际 CMake declaration 逐项输出 dependency、revision 和
-URL checksum；正式 wheel cache 绑定构建分支、SGLang source commit、`sgl-kernel`
-tree、基础镜像、CUDA、目标架构、依赖清单摘要以及精确 wheel 文件名和 SHA256。
-HPC-Ops 默认接受源码 checkout 当前 `HEAD`，并将实际 revision 写入 cache metadata；
-显式设置 `HPC_OPS_EXPECTED_REVISION` 时仍执行精确 revision 校验。cache 同样保存精确
-wheel 文件名和 SHA256。Mooncake 构建日志记录实际 clone 的 branch、commit 和所有递归 submodule
-commit；正式 cache 还绑定 build option、Python、完整 CMake 参数、精确 wheel 文件名
-和 SHA256。merge 模式只安装 metadata 指向且摘要匹配的单个 wheel；revision、构建
-来源或摘要不一致，以及旧 cache 缺少 `build_info.txt`，都直接失败。
+URL checksum；正式 wheel cache 绑定 `sgl-kernel` tree、基础镜像、CUDA、目标架构、
+依赖清单摘要以及精确 wheel 文件名和 SHA256（sglang 分支名和 source commit 仅作审计
+元数据记录，不参与校验）。HPC-Ops 默认接受源码 checkout 当前 `HEAD`，并将实际 revision
+写入 cache metadata；显式设置 `HPC_OPS_EXPECTED_REVISION` 时仍执行精确 revision 校验。
+cache 同样保存精确 wheel 文件名和 SHA256。Mooncake 从 JD-v0.5.17 起使用本地预置源码树
+原地编译，构建日志记录源码树 HEAD commit 和 submodule status（审计用）；正式 cache 绑定
+mooncake 版本号、build option、Python、完整 CMake 参数、精确 wheel 文件名和 SHA256。
+merge 模式只安装 metadata 指向且摘要匹配的单个 wheel；版本、构建来源或摘要不一致，
+以及旧 cache 缺少 `build_info.txt`，都直接失败。
 
 `-m` 在 host 侧交叉核验本地 `refs/heads/JD-${BASE_IMAGE_TAG}`、remote-tracking ref
 和 live origin；已有 ref 不一致或 tracking ref 未刷新时直接失败。确认权威 ref 后，
@@ -446,3 +447,49 @@ CMake identity 只排除脚本自动发现的 `yaml-cpp_DIR` 绝对路径，该�
 1 且就是 `HEAD`。默认只创建本地分支和 worktree，不 push、不启动远端流水线、不
 产出镜像。迁移后还必须复核单 Server 的 15 项固定清单、模型特定 CPU fixture、
 5 秒心跳和普通 case 失败继续行为没有被上游接口变化破坏。
+
+## 版本升级感知机制
+
+JD CI 的所有组件版本锁定值都从代码或基础镜像运行时自动推导，没有人工硬编码版本号。
+升级时无需修改任何版本常量——切到新分支后，所有版本号和缓存目录自动跟随变化。
+
+### 自动感知的版本值
+
+| 版本值 | 推导方式 | 感知时机 |
+| --- | --- | --- |
+| SGLang 版本 | `git describe --tags --match 'v[0-9]*' --abbrev=0 HEAD` | 切分支后自动变 |
+| 基础镜像 tag | `${BASE_IMAGE_PREFIX}:${BASE_IMAGE_TAG}`，由 SGLang 版本推导 | 跟随 SGLang 版本 |
+| 正式分支名 | `JD-${BASE_IMAGE_TAG}` | 跟随 SGLang 版本 |
+| SGL-Kernel 代码树 | `git rev-parse HEAD:python/sglang/kernels/aot` | 仓库 kernel 代码变了 tree 就变 |
+| SGL-Kernel 依赖 | 运行时扫描 `CMakeLists.txt` 所有 `FetchContent_Declare` 的 `URL_HASH`/`GIT_TAG` 算 sha256 | CMakeLists 依赖版本变了 sha256 就变 |
+| Mooncake 版本 | `docker run ${BASE_IMAGE} pip list` 读 mooncake-transfer-engine 版本 | 基础镜像升级后自动变 |
+| HPC-Ops revision | `git -C ${HPC_OPS_SOURCE_HOST} rev-parse HEAD` | hpc-ops 仓库 `git pull` 后自动变 |
+| `-m` 期望 source commit | `git rev-parse refs/remotes/origin/JD-${BASE_IMAGE_TAG}^{commit}` | fetch 后自动变 |
+| `-m` 期望 kernel tree | `git rev-parse refs/remotes/origin/JD-${BASE_IMAGE_TAG}:python/sglang/kernels/aot` | fetch 后自动变 |
+
+### 升级时的预期失败链（非 bug，是设计保护）
+
+以 v0.5.16 → v0.5.17 为例，升级后第一次跑 CI 会触发以下预期失败，每个都有运行时校验保护：
+
+1. **持久缓存为空**：`sgl-kernel/v0.5.17/` 和 `mooncake_te/v0.3.12.post1/` 是新目录。
+   `-m` 模式必然 cache miss 并 exit 1，必须先跑 `-r` 预热。
+2. **Mooncake 本地源码树缺失**：如果 `mooncake_te/v0.3.12.post1/Mooncake/` 未预置，
+   `build_mooncake.sh` 版本校验失败并 exit 1。需提前从上游 clone 对应 tag 源码树并
+   初始化 `extern/` 子模块内容。
+3. **SGL-Kernel FetchContent 依赖变化**：如果 `CMakeLists.txt` 的依赖版本变了，
+   `FETCHCONTENT_REVISIONS_SHA256` 自动失效，`sanitize_fetchcontent_cache` 清理旧 build
+   状态后重新下载。控制机无法访问 github 时需手动从可联网机器复制 `_deps` 缓存。
+4. **基础镜像未拉取**：`docker run ${BASE_IMAGE}` 失败。需 `docker pull` 新基础镜像。
+
+### 升级前环境准备 checklist
+
+升级不涉及任何版本号修改，但需要完成以下环境准备（每步都有运行时校验，漏了会失败
+而不是产出错版本）：
+
+- [ ] `docker pull ${BASE_IMAGE_PREFIX}:v<新版本>` 拉取新基础镜像
+- [ ] 预置 Mooncake 本地源码树到 `mooncake_te/v<新mooncake版本>/Mooncake/`，
+      含 `extern/` 子模块内容和 `mooncake-wheel/pyproject.toml`（version 须与基础镜像一致）
+- [ ] 在 hpc-ops 仓库 `git pull` 更新到对应版本
+- [ ] 若控制机无 github 访问，从可联网机器复制 SGL-Kernel `_deps` 依赖缓存到
+      `sgl-kernel/v<新版本>/_deps`（仅当 CMakeLists 依赖版本有变化时需要）
+- [ ] 先跑 `-r` 预热持久缓存，再跑 `-m` 出正式镜像

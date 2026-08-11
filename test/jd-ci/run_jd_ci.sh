@@ -727,7 +727,7 @@ run_docker_attached docker run \
     --net=host --pid=host --ipc=host --privileged \
     --gpus all \
     -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
-    -e NVIDIA_VISIBLE_DEVICES=all \
+    -e NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all} \
     -e DISPLAY=${DISPLAY:-} \
     -e WHEEL_CACHE_DIR=/wheels \
     -e MOONCAKE_ENGINE_CACHE_DIR="${MOONCAKE_ENGINE_CACHE_HOST}" \
