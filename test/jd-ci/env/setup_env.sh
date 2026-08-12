@@ -22,6 +22,10 @@ git config --global --add safe.directory "${SOURCE_PATH}" 2>/dev/null || true
 pip config set global.index-url https://mirrors.jd.com/pypi/web/simple 2>/dev/null || true
 pip config set global.trusted-host mirrors.jd.com 2>/dev/null || true
 
+# ---------- evalscope[perf] 压测工具 ----------
+# 用于 serving 压测 / 缓存命中率等基准测试用例；装不上不阻塞环境初始化。
+pip install -U "evalscope[perf]" 2>/dev/null || true
+
 # ---------- 引擎源码替换 ----------
 if [ -d /sgl-workspace/sglang/python ]; then
     \cp -r "${SOURCE_PATH}/python/"* /sgl-workspace/sglang/python/
