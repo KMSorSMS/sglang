@@ -1,4 +1,9 @@
-# Elastic EP Fault-Tolerance Port Implementation Plan
+---
+title: "Elastic EP fault-tolerance port implementation plan"
+description: "Implementation and verification plan for the JD-v0.5.17 Elastic EP fault-tolerance port."
+---
+
+# Elastic EP fault-tolerance port implementation plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -8,7 +13,7 @@
 
 **Tech Stack:** Python 3, PyTorch distributed, pytest, SGLang scheduler/model-runner components, Mooncake Elastic EP, Ruff or repository-supported Python static checks.
 
-## Global Constraints
+## Global constraints
 
 - The only source behavior snapshot is `52f0654e147fd67568e95d71dd7d064c92dfe7f8`; do not use later source commits.
 - Preserve unrelated `JD-v0.5.17` scheduler, model-runner, EPLB, cache, IPC, and result-processing behavior.
@@ -322,3 +327,50 @@ git commit -m "feat(elastic-ep): port v0.5.17 fault tolerance" -m "Source behavi
 ```
 
 The final handoff must report all commits, changed paths, exact test commands, exit codes, and any test not run.
+
+### Task 7: Fix the post-review capacity-mask regression
+
+**Files:**
+- Modify: `python/sglang/srt/distributed/parallel_state.py`
+- Modify: `python/sglang/srt/managers/scheduler_elastic_ep_mixin.py`
+- Modify: `python/sglang/srt/model_executor/model_runner.py`
+- Modify: `test/registered/unit/elastic_ep/test_control_plane.py`
+
+**Interfaces:**
+- Preserve: launch-group-sized `GroupCoordinator.active_ranks` and
+  `active_ranks_cpu` for existing collective and DP-attention consumers.
+- Produce: `get_active_ranks_for_elastic_ep(cpu=False)`, which returns the
+  capacity-sized mask shared with `MooncakeBackendOptions`.
+- Consume: the capacity-sized view at scheduler ready, pre-forward admission,
+  and model-forward snapshot submission.
+
+- [x] **Step 1: Reproduce the 4/8 mask mismatch**
+
+Add a Mooncake GroupCoordinator test and a scheduler ready/admission test with
+launch size 4 and capacity 8. Confirm both fail on the reviewed implementation:
+the group lacks a capacity view and snapshot submission asserts on a 4/8
+length mismatch.
+
+- [x] **Step 2: Preserve and expose the Mooncake capacity mask**
+
+Keep references to the complete device and CPU tensors supplied to
+`MooncakeBackendOptions`. Continue exposing the existing short attributes, and
+route only Elastic EP snapshot consumers through the new capacity-view method.
+Do not pad short masks inside `ElasticEPState`, because that would not observe
+runtime scale updates for newly admitted ranks.
+
+- [x] **Step 3: Verify the focused regression**
+
+Run in `sgl0514-dev-wjl`:
+
+```bash
+env PYTHONPATH=python pytest -q test/registered/unit/elastic_ep/test_control_plane.py -k CapacitySizedActiveRanks
+```
+
+Expected: `2 passed`, with no length assertion.
+
+- [ ] **Step 4: Re-run surrounding acceptance checks**
+
+Run the complete Elastic EP control-plane file, the selected surrounding unit
+suite, repository pre-commit hooks, `compileall`, and `git diff --check`. Record
+fresh exit codes in the handoff and review report.

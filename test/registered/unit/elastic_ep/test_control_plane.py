@@ -31,6 +31,7 @@ from sglang.srt.managers.elastic_ep_status import (
 )
 from sglang.srt.managers.scheduler_elastic_ep_mixin import SchedulerElasticEPMixin
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -86,7 +87,7 @@ class TestScheduler(SchedulerElasticEPMixin):
         self.cur_batch_for_debug = None
 
 
-class TestCapacitySizedActiveRanks:
+class TestCapacitySizedActiveRanks(CustomTestCase):
     def test_mooncake_group_preserves_capacity_mask_for_elastic_ep(self):
         class FakeMooncakeBackendOptions:
             def __init__(self, active_ranks, recovered_rank, max_world_size=None):
@@ -963,3 +964,7 @@ class TestElasticEPStatusPublisher:
         healthy.publish_committed_active_ranks.assert_called_once_with(
             mask, adjusting=True
         )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))

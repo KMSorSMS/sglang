@@ -1,3 +1,8 @@
+---
+title: "Elastic EP fault-tolerance port design"
+description: "Design for porting the pinned Elastic EP fault-tolerance behavior to JD-v0.5.17."
+---
+
 # Elastic EP fault-tolerance port design
 
 ## Goal
@@ -60,6 +65,15 @@ staging slots, process-group probing, committed state, suspect state, and
 recovery readiness. Its public and internal interfaces will be adapted to the
 v0.5.17 implementation rather than replaced wholesale.
 
+The state is sized by `max_ep_size` when runtime scale reserves ranks beyond
+the launch world size. `GroupCoordinator.active_ranks` and
+`active_ranks_cpu` remain launch-group-sized for existing collective callers.
+Elastic EP snapshot callers use
+`GroupCoordinator.get_active_ranks_for_elastic_ep()` instead; this returns the
+capacity-sized Mooncake PG mask, including inactive reserved slots. The full
+view shares storage with the tensor passed to `MooncakeBackendOptions`, so a
+later scale-up updates the same mask observed by snapshot consensus.
+
 ### Scheduler control plane
 
 An Elastic EP scheduler mixin owns admission, snapshot draining, retract,
@@ -77,6 +91,11 @@ must compose with those boundaries.
 The v0.5.17 model runner submits the active snapshot after the relevant forward
 work. The port will retain current model-runner control flow and insert only the
 snapshot interaction required by the pinned source behavior.
+
+Both scheduler-ready CPU snapshots and model-forward device snapshots must use
+the capacity-sized GroupCoordinator view. Padding a launch-sized mask inside
+`ElasticEPState` is not valid because it would hide Mooncake's later updates to
+newly admitted ranks.
 
 ### Status and controller integration
 
@@ -157,6 +176,9 @@ outside this task.
 7. Focused Elastic EP unit tests and the selected surrounding regression tests
    pass.
 8. Repository-supported static checks pass for all changed Python files.
+9. With launch size 4 and `max_ep_size=8`, ready publication and pre-forward
+   admission commit an eight-element PG mask without treating reserved slots as
+   faults or recovery candidates.
 
 ## Out of scope
 
