@@ -54,7 +54,15 @@ class SchedulerIpcChannels:
                 context, zmq.PUSH, port_args.tokenizer_ipc_name, False
             )
             send_to_controller_raw = get_zmq_socket(
-                context, zmq.PUSH, port_args.controller_input_ipc_name, False
+                context,
+                zmq.PUSH,
+                port_args.controller_input_ipc_name,
+                False,
+                socket_options={
+                    zmq.CONFLATE: 1,
+                    zmq.SNDTIMEO: 0,
+                    zmq.LINGER: 0,
+                },
             )
             if skip_tokenizer_init:
                 # No decode work: send outputs straight to the tokenizer side

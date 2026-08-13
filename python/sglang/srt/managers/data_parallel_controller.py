@@ -76,6 +76,18 @@ logger = logging.getLogger(__name__)
 SCHEDULER_PIDS_ARG = "scheduler_pids"
 
 
+def _create_scheduler_status_receiver(
+    context: zmq.Context, endpoint: str
+) -> zmq.Socket:
+    return get_zmq_socket(
+        context,
+        zmq.PULL,
+        endpoint,
+        True,
+        socket_options={zmq.CONFLATE: 1},
+    )
+
+
 class LoadBalanceMethod(Enum):
     """Load balance method."""
 
@@ -152,8 +164,8 @@ class DataParallelController:
             self.recv_from_tokenizer = get_zmq_socket(
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
-            self.recv_from_scheduler = get_zmq_socket(
-                self.context, zmq.PULL, port_args.controller_input_ipc_name, True
+            self.recv_from_scheduler = _create_scheduler_status_receiver(
+                self.context, port_args.controller_input_ipc_name
             )
 
         # Dispatch method
