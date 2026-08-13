@@ -116,9 +116,7 @@ class TestCapacitySizedActiveRanks(CustomTestCase):
         ), patch(
             "sglang.srt.distributed.parallel_state.is_cuda_alike",
             return_value=False,
-        ), patch.object(
-            torch.distributed, "get_rank", return_value=0
-        ), patch.object(
+        ), patch.object(torch.distributed, "get_rank", return_value=0), patch.object(
             torch.distributed, "new_group", side_effect=[MagicMock(), MagicMock()]
         ):
             group = GroupCoordinator(
@@ -540,20 +538,15 @@ class TestRetractCacheAndExpertState(CustomTestCase):
         sched.tp_worker = MagicMock()
         sched.tp_worker.model_runner.eplb_manager = eplb_manager
 
-        with patch.object(
-            ElasticEPStateManager, "instance", return_value=state
-        ), patch("torch.cuda.synchronize"), patch.object(
-            envs.SGLANG_ELASTIC_EP_MAX_RETRACTION, "get", return_value=3
-        ):
+        with patch.object(ElasticEPStateManager, "instance", return_value=state), patch(
+            "torch.cuda.synchronize"
+        ), patch.object(envs.SGLANG_ELASTIC_EP_MAX_RETRACTION, "get", return_value=3):
             sched._retract_all_and_rebalance_on_rank_fault()
 
         batch.release_req.assert_called_once_with(0, 0, sched.server_args)
         assert state.pending_staging_slots == []
         eplb_manager.rebalance.assert_called_once()
-        assert (
-            state.active_ranks.tolist()
-            == state.committed_active_ranks_cpu.tolist()
-        )
+        assert state.active_ranks.tolist() == state.committed_active_ranks_cpu.tolist()
         assert (
             state.last_handled_committed_active_ranks_cpu.tolist()
             == state.committed_active_ranks_cpu.tolist()
@@ -874,9 +867,7 @@ class TestHandlerExceptionProtection:
                 SchedulerElasticEPMixin,
                 "_retract_all_and_rebalance_on_rank_fault",
                 boom,
-            ), patch(
-                "torch.cuda.synchronize"
-            ):
+            ), patch("torch.cuda.synchronize"):
                 with pytest.raises(RuntimeError, match="rebalance collective failed"):
                     sched._admit_elastic_ep_forward(MagicMock())
 

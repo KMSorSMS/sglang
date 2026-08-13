@@ -538,7 +538,7 @@ class DataParallelController:
 
     def _receive_ports_as_client(self, endpoint: str, node_rank: int) -> List[int]:
         """Receive worker ports from the server node."""
-        logger.debug(f"Connecting to node 0 to receive worker ports")
+        logger.debug("Connecting to node 0 to receive worker ports")
 
         req_socket = get_zmq_socket(self.context, zmq.REQ, endpoint, False)
         req_socket.setsockopt(zmq.RCVTIMEO, 600 * 1000)  # 10 minute timeout
