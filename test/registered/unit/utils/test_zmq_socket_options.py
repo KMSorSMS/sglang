@@ -35,6 +35,8 @@ class TestZmqSocketOptions(CustomTestCase):
     def test_custom_options_are_applied_to_real_socket(self):
         context = zmq.Context()
         endpoint = f"inproc://status-options-{uuid.uuid4().hex}"
+        receiver = context.socket(zmq.PULL)
+        receiver.bind(endpoint)
         socket = get_zmq_socket(
             context,
             zmq.PUSH,
@@ -52,6 +54,7 @@ class TestZmqSocketOptions(CustomTestCase):
             self.assertEqual(socket.getsockopt(zmq.LINGER), 0)
         finally:
             socket.close(0)
+            receiver.close(0)
             context.term()
 
     def test_custom_options_precede_connect(self):
