@@ -258,6 +258,10 @@ class GroupCoordinator:
     ca_comm: Optional[Any]  # Custom allreduce communicator
     torch_symm_mem_comm: Optional[Any]  # Torch symm mem communicator
     mq_broadcaster: Optional[Any]  # shared memory broadcaster
+    active_ranks: torch.Tensor  # active ranks in the current process group
+    active_ranks_cpu: torch.Tensor  # CPU mirror for the current process group
+    _elastic_ep_active_ranks: torch.Tensor  # includes reserved scale capacity
+    _elastic_ep_active_ranks_cpu: torch.Tensor  # CPU capacity-sized mirror
 
     def __init__(
         self,
@@ -343,6 +347,8 @@ class GroupCoordinator:
 
                 active_ranks = pg_active_ranks[: len(ranks)]
                 active_ranks_cpu = pg_active_ranks_cpu[: len(ranks)]
+                elastic_ep_active_ranks = pg_active_ranks
+                elastic_ep_active_ranks_cpu = pg_active_ranks_cpu
                 device_group = torch.distributed.new_group(
                     ranks,
                     backend="mooncake",
@@ -360,6 +366,8 @@ class GroupCoordinator:
                     len(ranks), dtype=torch.int32, device=self.device
                 )
                 active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
+                elastic_ep_active_ranks = active_ranks
+                elastic_ep_active_ranks_cpu = active_ranks_cpu
                 pg_options = get_torch_distributed_pg_options(group_name)
                 device_group = torch.distributed.new_group(
                     ranks,
@@ -380,6 +388,8 @@ class GroupCoordinator:
                 self.cpu_group = cpu_group
                 self.active_ranks = active_ranks
                 self.active_ranks_cpu = active_ranks_cpu
+                self._elastic_ep_active_ranks = elastic_ep_active_ranks
+                self._elastic_ep_active_ranks_cpu = elastic_ep_active_ranks_cpu
 
         assert self.cpu_group is not None
         assert self.device_group is not None
@@ -521,6 +531,18 @@ class GroupCoordinator:
             f"device_group={self.device_group} cpu_group={self.cpu_group} unique_name={self.unique_name} "
             f"world_size={self.world_size} rank_in_group={self.rank_in_group}"
         )
+
+    def get_active_ranks_for_elastic_ep(self, *, cpu: bool = False) -> torch.Tensor:
+        """Return the active-rank mask including reserved scale capacity.
+
+        ``active_ranks`` remains limited to the current process-group size for
+        existing collective callers. Elastic EP snapshot consensus instead
+        needs the complete Mooncake mask sized by ``max_world_size`` so its
+        state remains compatible with future runtime scale-up ranks.
+        """
+        if cpu:
+            return self._elastic_ep_active_ranks_cpu
+        return self._elastic_ep_active_ranks
 
     @property
     def first_rank(self):

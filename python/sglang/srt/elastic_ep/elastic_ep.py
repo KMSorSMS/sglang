@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Iterator, List, Optional
 
 import torch
@@ -45,6 +45,14 @@ class ElasticEPState:
     active_ranks: Optional[torch.Tensor]
     last_active_ranks: Optional[torch.Tensor]
     active_ranks_cpu: Optional[torch.Tensor]
+    committed_active_ranks_cpu: torch.Tensor
+    last_handled_committed_active_ranks_cpu: torch.Tensor
+    staging_active_ranks_cpu_slots: tuple[torch.Tensor, torch.Tensor]
+    staging_global_pg_active_ranks_cpu_slots: tuple[torch.Tensor, torch.Tensor]
+    consensus_scratch_cpu: torch.Tensor
+    ep_suspect_consensus_cpu: torch.Tensor
+    next_staging_slot: int = 0
+    pending_staging_slots: list[int] = field(default_factory=list)
     effective_ep_size: int = 0
     pending_ep_size: Optional[int] = None
     scale_phase: str = "idle"
@@ -57,13 +65,103 @@ class ElasticEPState:
     def is_active_equal_last(self) -> bool:
         return torch.equal(self.active_ranks, self.last_active_ranks)
 
+    def submit_active_snapshot(
+        self,
+        global_pg_active_ranks: torch.Tensor,
+        non_blocking: bool = True,
+    ) -> None:
+        """Stage active-rank masks for the next control-plane consensus."""
+        slot = self.next_staging_slot
+        self.next_staging_slot ^= 1
+        self.pending_staging_slots.append(slot)
+        assert len(self.pending_staging_slots) <= 2
+
+        active_staging = self.staging_active_ranks_cpu_slots[slot]
+        pg_staging = self.staging_global_pg_active_ranks_cpu_slots[slot]
+        if self.active_ranks.device.type == "cuda":
+            active_staging.copy_(self.active_ranks, non_blocking=non_blocking)
+        else:
+            active_staging.copy_(self.active_ranks)
+
+        assert global_pg_active_ranks.numel() == self.committed_active_ranks_cpu.numel()
+        if global_pg_active_ranks.device.type == "cuda":
+            pg_staging.copy_(global_pg_active_ranks, non_blocking=non_blocking)
+        else:
+            pg_staging.copy_(global_pg_active_ranks)
+
+    def commit_active_snapshot(
+        self, global_pg_active_ranks_cpu: torch.Tensor, consensus_cpu_group
+    ) -> bool:
+        """Commit the oldest staged masks through MIN consensus."""
+        if not self.pending_staging_slots:
+            return False
+
+        slot = self.pending_staging_slots.pop(0)
+        snapshot = self.staging_active_ranks_cpu_slots[slot]
+        pg_snapshot = self.staging_global_pg_active_ranks_cpu_slots[slot]
+        assert (
+            global_pg_active_ranks_cpu.numel()
+            == self.committed_active_ranks_cpu.numel()
+        )
+
+        self.committed_active_ranks_cpu.bitwise_and_(pg_snapshot)
+        self.committed_active_ranks_cpu.bitwise_and_(global_pg_active_ranks_cpu)
+        world = self.committed_active_ranks_cpu.numel()
+        self.consensus_scratch_cpu[:world].copy_(self.committed_active_ranks_cpu)
+        self.consensus_scratch_cpu[world:].copy_(snapshot)
+        torch.distributed.all_reduce(
+            self.consensus_scratch_cpu,
+            op=torch.distributed.ReduceOp.MIN,
+            group=consensus_cpu_group,
+        )
+        self.committed_active_ranks_cpu.copy_(self.consensus_scratch_cpu[:world])
+        self.ep_suspect_consensus_cpu.copy_(self.consensus_scratch_cpu[world:])
+        return True
+
+    def is_stale_snapshot(self) -> bool:
+        return not torch.equal(
+            self.committed_active_ranks_cpu,
+            self.last_handled_committed_active_ranks_cpu,
+        )
+
+    def ep_suspect_ranks(self) -> List[int]:
+        suspect = (self.ep_suspect_consensus_cpu == 0) & (
+            self.committed_active_ranks_cpu == 1
+        )
+        return torch.nonzero(suspect, as_tuple=False).flatten().tolist()
+
+    def has_ep_suspects(self) -> bool:
+        return bool(
+            (
+                (self.ep_suspect_consensus_cpu == 0)
+                & (self.committed_active_ranks_cpu == 1)
+            ).any()
+        )
+
+    def mark_snapshot_handled(self) -> None:
+        self.last_handled_committed_active_ranks_cpu.copy_(
+            self.committed_active_ranks_cpu
+        )
+
+    def clear_pending_snapshots(self) -> None:
+        self.pending_staging_slots.clear()
+        self.next_staging_slot = 0
+
+    def resync_active_to_committed(self) -> None:
+        self.active_ranks.copy_(self.committed_active_ranks_cpu)
+        self.ep_suspect_consensus_cpu.fill_(1)
+
     def sync_active_to_cpu(self):
         if self.active_ranks is not None:
             self.active_ranks_cpu = self.active_ranks.detach().cpu().clone()
+            self.committed_active_ranks_cpu.copy_(self.active_ranks_cpu)
 
     def snapshot_active_to_last(self):
         if self.active_ranks is not None:
             self.last_active_ranks = self.active_ranks.clone()
+            self.last_handled_committed_active_ranks_cpu.copy_(
+                self.active_ranks.detach().cpu()
+            )
 
     def reset(self):
         if self.active_ranks is not None:
@@ -72,6 +170,13 @@ class ElasticEPState:
             self.active_ranks[: self.effective_ep_size] = 1
             self.snapshot_active_to_last()
             self.sync_active_to_cpu()
+            self.clear_pending_snapshots()
+            self.consensus_scratch_cpu.fill_(1)
+            self.ep_suspect_consensus_cpu.fill_(1)
+            for staging in self.staging_active_ranks_cpu_slots:
+                staging.copy_(self.active_ranks_cpu)
+            for staging in self.staging_global_pg_active_ranks_cpu_slots:
+                staging.copy_(self.active_ranks_cpu)
 
 
 class ElasticEPStateManager:
@@ -149,10 +254,31 @@ class ElasticEPStateManager:
         cls, *, ep_size: Optional[int] = None, device: Optional[torch.device] = None
     ) -> ElasticEPState:
         active = cls.healthy_rank_state(ep_size=ep_size, device=device)
+        active_cpu = active.detach().cpu().clone()
+        if active.device.type == "cuda":
+            active_slots = (
+                active_cpu.clone().pin_memory(),
+                active_cpu.clone().pin_memory(),
+            )
+            pg_slots = (
+                active_cpu.clone().pin_memory(),
+                active_cpu.clone().pin_memory(),
+            )
+        else:
+            active_slots = (active_cpu.clone(), active_cpu.clone())
+            pg_slots = (active_cpu.clone(), active_cpu.clone())
+
+        world = active_cpu.numel()
         return ElasticEPState(
             active_ranks=active,
             last_active_ranks=active.clone(),
-            active_ranks_cpu=active.detach().cpu().clone(),
+            active_ranks_cpu=active_cpu.clone(),
+            committed_active_ranks_cpu=active_cpu.clone(),
+            last_handled_committed_active_ranks_cpu=active_cpu.clone(),
+            staging_active_ranks_cpu_slots=active_slots,
+            staging_global_pg_active_ranks_cpu_slots=pg_slots,
+            consensus_scratch_cpu=torch.ones(2 * world, dtype=torch.int32),
+            ep_suspect_consensus_cpu=torch.ones(world, dtype=torch.int32),
         )
 
     @classmethod
@@ -379,6 +505,13 @@ def _try_recover_world(global_ranks: List[int]) -> bool:
     recover_ranks(world_backend, global_ranks)
     logger.debug("[Elastic EP][recover] WORLD recover_ranks(%s) done", global_ranks)
     return True
+
+
+def can_recover_ranks(global_ranks: List[int]) -> bool:
+    """Return whether every requested WORLD peer is ready for recovery."""
+    from mooncake.pg import get_peer_state
+
+    return all(get_peer_state(torch.distributed.group.WORLD, global_ranks))
 
 
 def try_admit_scale_ranks(global_ranks: List[int]) -> bool:

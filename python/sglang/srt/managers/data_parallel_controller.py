@@ -76,6 +76,18 @@ logger = logging.getLogger(__name__)
 SCHEDULER_PIDS_ARG = "scheduler_pids"
 
 
+def _create_scheduler_status_receiver(
+    context: zmq.Context, endpoint: str
+) -> zmq.Socket:
+    return get_zmq_socket(
+        context,
+        zmq.PULL,
+        endpoint,
+        True,
+        socket_options={zmq.CONFLATE: 1},
+    )
+
+
 class LoadBalanceMethod(Enum):
     """Load balance method."""
 
@@ -152,6 +164,9 @@ class DataParallelController:
             self.recv_from_tokenizer = get_zmq_socket(
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
+            self.recv_from_scheduler = _create_scheduler_status_receiver(
+                self.context, port_args.controller_input_ipc_name
+            )
 
         # Dispatch method
         self.round_robin_counter = 0
@@ -185,6 +200,7 @@ class DataParallelController:
             caller="DataParallelController",
         )
         self._last_refresh_time = 0.0
+        self.elastic_ep_send_timeout_ms = envs.SGLANG_ELASTIC_EP_SEND_TIMEOUT_MS.get()
 
         # To protect changing env vars to set CUDA_VISIBLE_DEVICES.
         self.env_lock = threading.Lock()
@@ -397,6 +413,13 @@ class DataParallelController:
                     tmp_port_args.scheduler_input_ipc_name,
                     True,
                 )
+                if (
+                    server_args.elastic_ep_backend is not None
+                    and self.elastic_ep_send_timeout_ms >= 0
+                ):
+                    self.workers[dp_rank].setsockopt(
+                        zmq.SNDTIMEO, self.elastic_ep_send_timeout_ms
+                    )
 
         # Free all sockets before starting the threads to launch TP workers
         for sock in sockets:
@@ -515,7 +538,7 @@ class DataParallelController:
 
     def _receive_ports_as_client(self, endpoint: str, node_rank: int) -> List[int]:
         """Receive worker ports from the server node."""
-        logger.debug(f"Connecting to node 0 to receive worker ports")
+        logger.debug("Connecting to node 0 to receive worker ports")
 
         req_socket = get_zmq_socket(self.context, zmq.REQ, endpoint, False)
         req_socket.setsockopt(zmq.RCVTIMEO, 600 * 1000)  # 10 minute timeout
@@ -577,6 +600,13 @@ class DataParallelController:
                 )
                 worker_ports.append(worker_port)
                 self.workers[slot] = worker_socket
+                if (
+                    server_args.elastic_ep_backend is not None
+                    and self.elastic_ep_send_timeout_ms >= 0
+                ):
+                    worker_socket.setsockopt(
+                        zmq.SNDTIMEO, self.elastic_ep_send_timeout_ms
+                    )
                 logger.debug(
                     "Assigned port %s to worker slot %s on host %s",
                     worker_port,
@@ -660,6 +690,9 @@ class DataParallelController:
                     # so all dp ranks should use the same nccl port.
                     rank_port_args.nccl_port = port_args.nccl_port
                     rank_port_args.instance_id = port_args.instance_id
+                    rank_port_args.controller_input_ipc_name = (
+                        port_args.controller_input_ipc_name
+                    )
 
                 reader, writer = mp.Pipe(duplex=False)
                 gpu_id = (
@@ -764,7 +797,23 @@ class DataParallelController:
             self.round_robin_counter = (self.round_robin_counter + 1) % len(active)
             if self.status[slot]:
                 logger.debug(f"Choose worker {slot}")
-                sock_send(self.workers[slot], req)
+                try:
+                    sock_send(self.workers[slot], req)
+                except zmq.Again:
+                    if (
+                        self.server_args.elastic_ep_backend is None
+                        or self.elastic_ep_send_timeout_ms < 0
+                    ):
+                        raise
+                    self.status[slot] = False
+                    logger.warning(
+                        "Timed out sending request to DP worker %s after %s ms",
+                        slot,
+                        self.elastic_ep_send_timeout_ms,
+                        exc_info=True,
+                    )
+                    attempts += 1
+                    continue
                 return
             attempts += 1
         raise RuntimeError(
@@ -802,11 +851,25 @@ class DataParallelController:
         while True:
             while True:
                 self.soft_watchdog.feed()
+                drained = False
                 try:
                     recv_req = sock_recv(self.recv_from_tokenizer, flags=zmq.NOBLOCK)
                 except zmq.ZMQError:
+                    pass
+                else:
+                    self._request_dispatcher(recv_req)
+                    drained = True
+
+                try:
+                    recv_req = sock_recv(self.recv_from_scheduler, flags=zmq.NOBLOCK)
+                except zmq.ZMQError:
+                    pass
+                else:
+                    self._request_dispatcher(recv_req)
+                    drained = True
+
+                if not drained:
                     break
-                self._request_dispatcher(recv_req)
 
 
 def run_data_parallel_controller_process(

@@ -6,7 +6,7 @@ import os
 import socket
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import Mapping, Optional, Tuple, Union
 
 import psutil
 import zmq
@@ -379,6 +379,7 @@ def get_zmq_socket(
     socket_type: zmq.SocketType,
     endpoint: Optional[str] = None,
     bind: bool = True,
+    socket_options: Optional[Mapping[int, int]] = None,
 ) -> Union[zmq.Socket, Tuple[int, zmq.Socket]]:
     """Create and configure a ZeroMQ socket.
 
@@ -387,6 +388,7 @@ def get_zmq_socket(
         socket_type: Type of ZeroMQ socket to create.
         endpoint: Optional endpoint to bind/connect to. If None, binds to a random TCP port.
         bind: Whether to bind (True) or connect (False) to the endpoint. Ignored if endpoint is None.
+        socket_options: Options applied after defaults and before bind/connect.
 
     Returns:
         If endpoint is None: Tuple of (port, socket) where port is the randomly assigned TCP port.
@@ -394,23 +396,24 @@ def get_zmq_socket(
     """
     socket = context.socket(socket_type)
 
+    if endpoint is not None and is_zmq_endpoint_ipv6(endpoint):
+        socket.setsockopt(zmq.IPV6, 1)
+
+    config_socket(socket, socket_type)
+    for option, value in (socket_options or {}).items():
+        socket.setsockopt(option, value)
+
     if endpoint is None:
         # Bind to random TCP port
-        config_socket(socket, socket_type)
         port = socket.bind_to_random_port("tcp://*")
         return port, socket
+
+    if bind:
+        socket.bind(endpoint)
     else:
-        if is_zmq_endpoint_ipv6(endpoint):
-            socket.setsockopt(zmq.IPV6, 1)
+        socket.connect(endpoint)
 
-        config_socket(socket, socket_type)
-
-        if bind:
-            socket.bind(endpoint)
-        else:
-            socket.connect(endpoint)
-
-        return socket
+    return socket
 
 
 def is_zmq_endpoint_ipv6(endpoint: str) -> bool:

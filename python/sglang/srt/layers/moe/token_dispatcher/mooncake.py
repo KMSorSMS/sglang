@@ -163,7 +163,9 @@ class _MooncakeEPDispatcherImpl:
         assert self.num_max_dispatch_tokens_per_rank <= 1024
 
         self.first_execution = True
-        self.timeout_us = 10000000
+        # A2A timeout is a suspect signal only. Process-group probing remains
+        # the sole authority for declaring a peer dead.
+        self.timeout_us = get_int_env_var("SGLANG_MOONCAKE_EP_TIMEOUT_US", 50000000)
 
         self.handle = None
 

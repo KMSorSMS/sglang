@@ -100,10 +100,10 @@ from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
+from sglang.srt.managers.elastic_ep_status import create_elastic_ep_status_publisher
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
-    ActiveRanksOutput,
     AddExternalCorpusReqInput,
     AddExternalCorpusReqOutput,
     AttachHiCacheStorageReqInput,
@@ -248,6 +248,7 @@ from sglang.srt.managers.scheduler_components.request_receiver import (
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
+from sglang.srt.managers.scheduler_elastic_ep_mixin import SchedulerElasticEPMixin
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.utils import (
@@ -366,6 +367,7 @@ class Scheduler(
     SchedulerDisaggregationPrefillMixin,
     SchedulerMultiplexMixin,
     SchedulerPPMixin,
+    SchedulerElasticEPMixin,
     SchedulerDllmMixin,
     SchedulerMlxOverlapMixin,
 ):
@@ -736,6 +738,9 @@ class Scheduler(
                 or get_observability().enable_metrics_for_all_schedulers
             ),
             enable_scripted_runtime=envs.SGLANG_TEST_SCRIPTED_RUNTIME.get(),
+        )
+        self.elastic_ep_status_publisher = create_elastic_ep_status_publisher(
+            self.server_args, self.ipc_channels.send_to_controller
         )
 
         self.load_snapshot_writer = None
@@ -1733,7 +1738,14 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
+                if (
+                    self.server_args.elastic_ep_backend is not None
+                    and not self._admit_elastic_ep_forward(batch)
+                ):
+                    continue
                 result = self.run_batch(batch)
+                if self.server_args.elastic_ep_backend is not None:
+                    self._drain_elastic_ep_snapshot_copy(result)
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
@@ -1754,6 +1766,8 @@ class Scheduler(
         def pop_and_process():
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
+            if self.server_args.elastic_ep_backend is not None:
+                self._drain_elastic_ep_snapshot_copy(tmp_result)
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
@@ -1792,6 +1806,11 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
+                if (
+                    self.server_args.elastic_ep_backend is not None
+                    and not self._admit_elastic_ep_forward(batch)
+                ):
+                    continue
                 batch_result = self.run_batch(batch)
                 # Fence result processing behind this forward's shared reads.
                 self._apply_war_barrier()
@@ -1849,6 +1868,17 @@ class Scheduler(
             and batch.forward_mode.is_decode()
             and len(self.result_queue) > 0
         )
+
+        if self.require_mlp_sync:
+            grammar_serial = torch.tensor(
+                [1 if need_grammar_sync else 0], dtype=torch.int32
+            )
+            torch.distributed.all_reduce(
+                grammar_serial,
+                op=torch.distributed.ReduceOp.MAX,
+                group=self.tp_cpu_group,
+            )
+            need_grammar_sync = grammar_serial.item() == 1
 
         # Algorithms that support grammar overlap advance the FSM inside verify()
         # via the grammar barrier (overlapping the target forward), which resolves
@@ -3775,23 +3805,6 @@ class Scheduler(
         return ret
 
     def _maybe_report_active_ranks(self) -> None:
-        if not (
-            self.enable_dp_attention and get_exec().moe.elastic_ep_backend is not None
-        ):
-            return
-        from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
-
-        inst = ElasticEPStateManager.instance()
-        if inst is not None and inst.active_ranks_cpu is not None:
-            self.ipc_channels.send_to_tokenizer.send_output(
-                ActiveRanksOutput(
-                    status=[bool(x) for x in inst.active_ranks_cpu.tolist()]
-                )
-            )
-        else:
-            logger.debug("[Elastic EP] active rank state is unavailable")
-            return
-
         model_runner = self.tp_worker.model_runner
         pending = model_runner._pending_elastic_scale_update
         if pending is not None:
@@ -4971,6 +4984,8 @@ def run_scheduler_process(
             moe_dp_rank,
             dp_rank,
         )
+
+        scheduler._publish_elastic_ep_status_on_ready()
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
