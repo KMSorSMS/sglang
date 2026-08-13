@@ -40,6 +40,13 @@ Configure the dedicated health-feedback channel as a latest-value channel:
   `CompositeElasticEPStatusPublisher` unchanged.
 - Keep the existing DPC event-loop `NOBLOCK` receive unchanged.
 
+`CONFLATE` is a connection-scoped ZeroMQ option and must be applied before the
+socket binds or connects. Extend `get_zmq_socket()` with an optional
+`socket_options` mapping that is applied after the repository defaults but
+before `bind()` or `connect()`. Existing callers omit the argument and retain
+their current behavior. The status sender and receiver pass only their
+dedicated option mappings through this seam.
+
 `CONFLATE=1` bounds each socket queue to the newest single-part
 `ActiveRanksOutput` message. `SNDTIMEO=0` makes an unavailable send fail
 immediately with `zmq.Again`; the existing composite publisher isolates that
@@ -115,9 +122,10 @@ large send loop, avoiding flaky timing and memory-sensitive CI behavior.
 
 ## Scope and compatibility
 
-Production changes are limited to the dedicated Scheduler-to-DPC status socket
-configuration in:
+Production changes are limited to a backward-compatible pre-connect option seam
+and the dedicated Scheduler-to-DPC status socket configuration in:
 
+- `python/sglang/srt/utils/network.py`
 - `python/sglang/srt/managers/scheduler_components/ipc_channels.py`
 - `python/sglang/srt/managers/data_parallel_controller.py`
 
