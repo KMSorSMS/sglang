@@ -36,6 +36,7 @@ from sglang.srt.managers.elastic_ep_status import (
     _compute_cluster_state,
     _effective_committed_active_ranks,
 )
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.ipc_channels import (
     SchedulerIpcChannels,
 )
@@ -666,6 +667,22 @@ class TestGrammarGlobalSerial:
     grammar sync (serial) while another does not (overlap), the scheduler
     timeline desynchronizes and re-introduces the EP A2A deadlock.
     all_reduce MAX ensures all ranks make the same serial/overlap decision."""
+
+    def test_idle_batch_participates_with_false_grammar_flag(self):
+        sched = SimpleNamespace(
+            require_mlp_sync=True,
+            result_queue=[],
+            tp_cpu_group=MagicMock(),
+        )
+
+        with patch("torch.distributed.all_reduce") as mock_all_reduce:
+            result = Scheduler.is_disable_overlap_for_batch(
+                sched, batch=None, last_batch=None
+            )
+
+        assert result is False
+        mock_all_reduce.assert_called_once()
+        assert mock_all_reduce.call_args.args[0].item() == 0
 
     def _compute_grammar_sync(self, need_grammar_sync, require_mlp_sync):
         """Replicate the grammar-consensus snippet from is_disable_overlap_for_batch."""
