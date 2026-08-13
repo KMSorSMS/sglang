@@ -17,8 +17,10 @@ class TestJDInternalCIContract(unittest.TestCase):
         prologue = self._script().split("CI_SCRIPT_PATH=", maxsplit=1)[0]
         env = os.environ.copy()
         for name in (
+            "JD_CI_SKIP_DEEPEP_BUILD",
             "JD_CI_SKIP_MOONCAKE_BUILD",
             "JD_CI_SKIP_SGL_KERNEL_BUILD",
+            "JD_CI_SKIP_HPC_OPS_BUILD",
             "JD_CI_SKIP_TEST",
         ):
             env.pop(name, None)
@@ -79,8 +81,10 @@ class TestJDInternalCIContract(unittest.TestCase):
                     "-t, --temp-image",
                     "note__merge_request",
                     "merge_request__merged",
+                    "JD_CI_SKIP_DEEPEP_BUILD",
                     "JD_CI_SKIP_SGL_KERNEL_BUILD",
                     "JD_CI_SKIP_MOONCAKE_BUILD",
+                    "JD_CI_SKIP_HPC_OPS_BUILD",
                     "JD_CI_SKIP_TEST",
                 ):
                     self.assertIn(expected, result.stdout)
@@ -95,8 +99,10 @@ class TestJDInternalCIContract(unittest.TestCase):
 
     def test_temporary_options_only_accept_binary_values(self):
         for name in (
+            "JD_CI_SKIP_DEEPEP_BUILD",
             "JD_CI_SKIP_SGL_KERNEL_BUILD",
             "JD_CI_SKIP_MOONCAKE_BUILD",
+            "JD_CI_SKIP_HPC_OPS_BUILD",
             "JD_CI_SKIP_TEST",
         ):
             with self.subTest(name=name):
@@ -108,8 +114,10 @@ class TestJDInternalCIContract(unittest.TestCase):
     def test_formal_modes_reject_temporary_skip_options(self):
         for mode in ("-r", "note__merge_request", "-m", "merge_request__merged"):
             for name in (
+                "JD_CI_SKIP_DEEPEP_BUILD",
                 "JD_CI_SKIP_SGL_KERNEL_BUILD",
                 "JD_CI_SKIP_MOONCAKE_BUILD",
+                "JD_CI_SKIP_HPC_OPS_BUILD",
                 "JD_CI_SKIP_TEST",
             ):
                 with self.subTest(mode=mode, name=name):
@@ -121,8 +129,10 @@ class TestJDInternalCIContract(unittest.TestCase):
     def test_temp_mode_allows_explicit_skips(self):
         result = self._run_argument_prologue(
             "-t",
+            JD_CI_SKIP_DEEPEP_BUILD="1",
             JD_CI_SKIP_SGL_KERNEL_BUILD="1",
             JD_CI_SKIP_MOONCAKE_BUILD="1",
+            JD_CI_SKIP_HPC_OPS_BUILD="1",
             JD_CI_SKIP_TEST="1",
         )
 
@@ -137,6 +147,40 @@ class TestJDInternalCIContract(unittest.TestCase):
         self.assertEqual(
             script.count("bash '${SOURCE_PATH}/test/jd-ci/env/build_sgl_kernel.sh'"),
             1,
+        )
+
+    def test_deepep_patch_build_is_temp_only_and_skippable(self):
+        script = self._script()
+
+        self.assertIn(
+            'JD_CI_SKIP_DEEPEP_BUILD="${JD_CI_SKIP_DEEPEP_BUILD:-0}"',
+            script,
+        )
+        self.assertIn(
+            'DEEPEP_TORCH_CUDA_ARCH_LIST="${DEEPEP_TORCH_CUDA_ARCH_LIST:-9.0;10.0a;10.3a}"',
+            script,
+        )
+        self.assertEqual(
+            script.count(
+                "bash '/sgl-workspace/sglang/docker/kimi_k3/apply_deepep_k3_patch.sh'"
+            ),
+            1,
+        )
+        self.assertIn("if [[ '${CI_MODE}' != 'temp-image' ]]; then", script)
+        self.assertIn(
+            "elif [[ '${JD_CI_SKIP_DEEPEP_BUILD}' == '1' ]]; then", script
+        )
+        self.assertIn("DEEPEP_DIR='/sgl-workspace/DeepEP'", script)
+        self.assertIn(
+            "TORCH_CUDA_ARCH_LIST='${DEEPEP_TORCH_CUDA_ARCH_LIST}'", script
+        )
+        self.assertIn(
+            "rm -rf /sgl-workspace/DeepEP/build /sgl-workspace/DeepEP/dist",
+            script,
+        )
+        self.assertLess(
+            script.index("apply_deepep_k3_patch.sh"),
+            script.index("if [[ '${RUN_CI_TESTS}' == '1' ]]; then"),
         )
 
     def test_sgl_kernel_build_is_enabled_by_default(self):
@@ -701,9 +745,11 @@ printf 'LENGTH=%s\\n' "${#value}"
 
         for required in (
             'MAIN_PIPELINE_LOG="${CI_CONTAINER_LOGS_DIR}/sglang.log"',
+            'DEEPEP_BUILD_LOG="${CI_BUILD_LOGS_DIR}/deepep.log"',
             'SGL_KERNEL_BUILD_LOG="${CI_BUILD_LOGS_DIR}/sgl-kernel.log"',
             'MOONCAKE_TE_BUILD_LOG="${CI_BUILD_LOGS_DIR}/mooncake-te.log"',
             'MAIN_CONTAINER_WORK_DIR="${CI_RUNNER_WORK_DIR}/containers/sglang"',
+            'DEEPEP_WORK_DIR="${CI_RUNNER_WORK_DIR}/builds/deepep"',
             'SGL_KERNEL_WORK_DIR="${CI_RUNNER_WORK_DIR}/builds/sgl-kernel"',
             'MOONCAKE_TE_WORK_DIR="${CI_RUNNER_WORK_DIR}/builds/mooncake-te"',
             'CPU_MOCK_TEST_WORK_DIR="${CI_RUNNER_WORK_DIR}/tests/cpu-mock"',

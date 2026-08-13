@@ -41,6 +41,7 @@ EXPECTED_V0517_COMMITS = {
     "e146f63f35d23ae0d08fa8e4e95fa65b3d08999e",
     "d7dae680b3e7b78dfb838d83b96cd805d7c2a652",
     "9e8dda1cbe8f64cc908a89b332eadf7f4ea5d23b",
+    "bbe3e3ef5d466cb1e55216d342ac0ebe3cb5519c",
     "4b4176639fdb6b4413dcbd3bb60e238397b918fc",
     "ae274515d9d59a53f03a9a2292e444f88d918f8e",
     "dc1d5dc6ec2ce5cdd7187c2a2da2d133ec94b46b",

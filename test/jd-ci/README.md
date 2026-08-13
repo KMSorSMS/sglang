@@ -216,15 +216,17 @@ bash test/jd-ci/run_jd_ci.sh -t  # 临时分支验证镜像
 `merge_request__merged` 继续分别兼容 `-r` 和 `-m`，方便现有流水线事件调用方
 无缝迁移。
 
-`-t` 只能在非正式分支运行，三个临时选项只接受 `0` 或 `1`：
+`-t` 只能在非正式分支运行，以下临时选项只接受 `0` 或 `1`：
 
 | 环境变量 | 默认值 | `0` | `1` |
 | --- | --- | --- | --- |
+| `JD_CI_SKIP_DEEPEP_BUILD` | `0` | 应用镜像内 Kimi-K3 patch，重编并安装 DeepEP wheel | 继承基础镜像 DeepEP，不包含本次 top-k 16 overlay |
 | `JD_CI_SKIP_SGL_KERNEL_BUILD` | `0` | 在本次 commit runner 的 `artifacts/` 目录编译并安装 | 用户确认无相关改动，继承基础镜像组件 |
 | `JD_CI_SKIP_MOONCAKE_BUILD` | `0` | 在同一 commit 临时根目录编译并安装 Mooncake TE | 用户确认无相关改动，继承基础镜像组件 |
+| `JD_CI_SKIP_HPC_OPS_BUILD` | `0` | 在同一 commit 临时根目录编译并安装 hpc-ops | 用户确认无相关改动，继承基础镜像组件 |
 | `JD_CI_SKIP_TEST` | `0` | 固定执行全部三类 JD 回归 | 跳过全部回归并生成显式 skip 报告 |
 
-三个变量默认均为 `0`，并且只允许用于 `-t`。任何一个变量在 `-r` 或 `-m` 中设为
+这些变量默认均为 `0`，并且只允许用于 `-t`。任何一个变量在 `-r` 或 `-m` 中设为
 `1` 都会在 Git/Docker 主流程前以状态码 `2` 拒绝。`JD_CI_SKIP_TEST=1` 只表示用户
 主动放弃本次临时镜像的回归结论，不代表测试通过；汇总报告会把三类回归都记录为
 显式 skip。
@@ -241,9 +243,14 @@ bash test/jd-ci/run_jd_ci.sh -t
 # 用户确认 SGL-Kernel 无改动，只继承基础镜像中的版本
 JD_CI_SKIP_SGL_KERNEL_BUILD=1 bash test/jd-ci/run_jd_ci.sh -t
 
-# 用户确认两个组件均无改动，并显式跳过全部 JD 回归
+# 用户接受基础镜像中的原始 DeepEP，不构建 Kimi-K3 top-k 16 overlay
+JD_CI_SKIP_DEEPEP_BUILD=1 bash test/jd-ci/run_jd_ci.sh -t
+
+# 用户确认所有组件均可继承基础镜像，并显式跳过全部 JD 回归
+JD_CI_SKIP_DEEPEP_BUILD=1 \
 JD_CI_SKIP_SGL_KERNEL_BUILD=1 \
 JD_CI_SKIP_MOONCAKE_BUILD=1 \
+JD_CI_SKIP_HPC_OPS_BUILD=1 \
 JD_CI_SKIP_TEST=1 \
   bash test/jd-ci/run_jd_ci.sh -t
 ```
@@ -252,6 +259,8 @@ JD_CI_SKIP_TEST=1 \
 
 | 分支改动 | 推荐命令前缀 | 实际行为 |
 | --- | --- | --- |
+| 需要 Kimi-K3 DeepEP top-k 16 overlay | 保持 `JD_CI_SKIP_DEEPEP_BUILD=0` | patch `/sgl-workspace/DeepEP`，重编安装 wheel，再执行回归和镜像打包 |
+| 不需要 Kimi-K3 DeepEP overlay | `JD_CI_SKIP_DEEPEP_BUILD=1` | 继承基础镜像原始 DeepEP，不获得 top-k 16 支持 |
 | SGLang 或 SGL-Kernel 有改动，Mooncake 无改动 | `JD_CI_SKIP_MOONCAKE_BUILD=1` | 重编 SGL-Kernel，继承基础镜像 Mooncake，执行全量回归 |
 | Mooncake 有改动，SGL-Kernel 无改动 | `JD_CI_SKIP_SGL_KERNEL_BUILD=1` | 重编 Mooncake TE，继承基础镜像 SGL-Kernel，执行全量回归 |
 | 两个组件均无改动 | 两个组件 skip 均为 `1` | 继承基础镜像组件，仍执行全量回归 |

@@ -26,6 +26,7 @@ print_usage() {
   -h, --help         显示本帮助并退出。
 
 临时镜像选项（仅用于 -t，只接受 0 或 1）:
+  JD_CI_SKIP_DEEPEP_BUILD     默认 0；1 表示继承基础镜像中的 DeepEP。
   JD_CI_SKIP_SGL_KERNEL_BUILD  默认 0；1 表示继承基础镜像中的 SGL-Kernel。
   JD_CI_SKIP_MOONCAKE_BUILD    默认 0；1 表示继承基础镜像中的 Mooncake。
   JD_CI_SKIP_HPC_OPS_BUILD     默认 0；1 表示继承基础镜像中的 hpc-ops。
@@ -44,10 +45,12 @@ print_usage() {
   test/jd-ci/run_jd_ci.sh -m
   test/jd-ci/run_jd_ci.sh merge_request__merged
   test/jd-ci/run_jd_ci.sh -t
+  JD_CI_SKIP_DEEPEP_BUILD=1 test/jd-ci/run_jd_ci.sh -t
   JD_CI_SKIP_SGL_KERNEL_BUILD=1 test/jd-ci/run_jd_ci.sh -t
   JD_CI_SKIP_MOONCAKE_BUILD=1 test/jd-ci/run_jd_ci.sh -t
   JD_CI_SKIP_HPC_OPS_BUILD=1 test/jd-ci/run_jd_ci.sh -t
-  JD_CI_SKIP_SGL_KERNEL_BUILD=1 JD_CI_SKIP_MOONCAKE_BUILD=1 \
+  JD_CI_SKIP_DEEPEP_BUILD=1 JD_CI_SKIP_SGL_KERNEL_BUILD=1 \
+    JD_CI_SKIP_MOONCAKE_BUILD=1 \
     JD_CI_SKIP_HPC_OPS_BUILD=1 test/jd-ci/run_jd_ci.sh -t
   JD_CI_SKIP_TEST=1 test/jd-ci/run_jd_ci.sh -t
 EOF
@@ -84,6 +87,7 @@ sanitize_docker_tag_component() {
     printf '%.48s\n' "${value}"
 }
 
+JD_CI_SKIP_DEEPEP_BUILD="${JD_CI_SKIP_DEEPEP_BUILD:-0}"
 JD_CI_SKIP_MOONCAKE_BUILD="${JD_CI_SKIP_MOONCAKE_BUILD:-0}"
 JD_CI_SKIP_SGL_KERNEL_BUILD="${JD_CI_SKIP_SGL_KERNEL_BUILD:-0}"
 JD_CI_SKIP_HPC_OPS_BUILD="${JD_CI_SKIP_HPC_OPS_BUILD:-0}"
@@ -121,13 +125,15 @@ case "${1:--r}" in
         ;;
 esac
 
+validate_binary_option "JD_CI_SKIP_DEEPEP_BUILD" "${JD_CI_SKIP_DEEPEP_BUILD}"
 validate_binary_option "JD_CI_SKIP_SGL_KERNEL_BUILD" "${JD_CI_SKIP_SGL_KERNEL_BUILD}"
 validate_binary_option "JD_CI_SKIP_MOONCAKE_BUILD" "${JD_CI_SKIP_MOONCAKE_BUILD}"
 validate_binary_option "JD_CI_SKIP_HPC_OPS_BUILD" "${JD_CI_SKIP_HPC_OPS_BUILD}"
 validate_binary_option "JD_CI_SKIP_TEST" "${JD_CI_SKIP_TEST}"
 
 if [[ "${CI_MODE}" != "temp-image" ]] \
-    && [[ "${JD_CI_SKIP_SGL_KERNEL_BUILD}" == "1" \
+    && [[ "${JD_CI_SKIP_DEEPEP_BUILD}" == "1" \
+        || "${JD_CI_SKIP_SGL_KERNEL_BUILD}" == "1" \
         || "${JD_CI_SKIP_MOONCAKE_BUILD}" == "1" \
         || "${JD_CI_SKIP_HPC_OPS_BUILD}" == "1" \
         || "${JD_CI_SKIP_TEST}" == "1" ]]; then
@@ -284,6 +290,7 @@ echo "[SGLang CI] CLOUD_IMAGE:${CLOUD_IMAGE}"
 # sgl-kernel wheel 持久化缓存目录。容器内 env/build_sgl_kernel.sh 会继续按
 # CUDA Toolkit 版本和目标架构分桶，避免 H-only wheel 被 B 系列复用。
 SGLANG_KERNEL_TARGET_ARCHS="${SGLANG_KERNEL_TARGET_ARCHS:-sm90,sm90a,sm100a,sm103a}"
+DEEPEP_TORCH_CUDA_ARCH_LIST="${DEEPEP_TORCH_CUDA_ARCH_LIST:-9.0;10.0a;10.3a}"
 JD_CI_BASE_REF="${JD_CI_BASE_REF:-${BASE_IMAGE_TAG}}"
 JD_CI_SERVER_API_GPU_ID="${JD_CI_SERVER_API_GPU_ID:-0}"
 JD_CI_SERVER_API_MODEL_PATH="${JD_CI_SERVER_API_MODEL_PATH:-/mnt/nas/models/Qwen2.5-VL-7B-Instruct/}"
@@ -340,6 +347,7 @@ case "${CI_MODE}" in
         ;;
 esac
 echo "[SGLang CI] SGLANG_KERNEL_TARGET_ARCHS=${SGLANG_KERNEL_TARGET_ARCHS}"
+echo "[SGLang CI] DEEPEP_TORCH_CUDA_ARCH_LIST=${DEEPEP_TORCH_CUDA_ARCH_LIST}"
 echo "[SGLang CI] RELEASE_ARTIFACT_BRANCH=${RELEASE_ARTIFACT_BRANCH}"
 echo "[SGLang CI] JD_CI_ARTIFACT_SCOPE=${JD_CI_ARTIFACT_SCOPE}"
 echo "[SGLang CI] SGL_KERNEL_ARTIFACT_SCOPE=${SGL_KERNEL_ARTIFACT_SCOPE}"
@@ -367,6 +375,7 @@ else
     HPC_OPS_FORCE_REBUILD=1
     HPC_OPS_REQUIRE_CACHE=0
 fi
+echo "[SGLang CI] JD_CI_SKIP_DEEPEP_BUILD=${JD_CI_SKIP_DEEPEP_BUILD}"
 echo "[SGLang CI] JD_CI_SKIP_MOONCAKE_BUILD=${JD_CI_SKIP_MOONCAKE_BUILD}"
 echo "[SGLang CI] JD_CI_SKIP_SGL_KERNEL_BUILD=${JD_CI_SKIP_SGL_KERNEL_BUILD}"
 echo "[SGLang CI] JD_CI_SKIP_HPC_OPS_BUILD=${JD_CI_SKIP_HPC_OPS_BUILD}"
@@ -385,6 +394,7 @@ CI_CONTAINER_LOGS_DIR="${CI_LOGS_DIR}/containers"
 CI_BUILD_LOGS_DIR="${CI_LOGS_DIR}/builds"
 CI_TEST_LOGS_DIR="${CI_LOGS_DIR}/tests"
 MAIN_PIPELINE_LOG="${CI_CONTAINER_LOGS_DIR}/sglang.log"
+DEEPEP_BUILD_LOG="${CI_BUILD_LOGS_DIR}/deepep.log"
 SGL_KERNEL_BUILD_LOG="${CI_BUILD_LOGS_DIR}/sgl-kernel.log"
 MOONCAKE_TE_BUILD_LOG="${CI_BUILD_LOGS_DIR}/mooncake-te.log"
 HPC_OPS_BUILD_LOG="${CI_BUILD_LOGS_DIR}/hpc-ops.log"
@@ -393,6 +403,7 @@ FINAL_MAIN_TAIL_LOG="${CI_FINAL_STATE_ROOT}/containers/sglang.log"
 CI_RUNNER_WORK_DIR="${CI_RUNNER_ROOT}/work"
 MAIN_CONTAINER_WORK_DIR="${CI_RUNNER_WORK_DIR}/containers/sglang"
 MAIN_CONTAINER_TMP_DIR="${MAIN_CONTAINER_WORK_DIR}/tmp"
+DEEPEP_WORK_DIR="${CI_RUNNER_WORK_DIR}/builds/deepep"
 SGL_KERNEL_WORK_DIR="${CI_RUNNER_WORK_DIR}/builds/sgl-kernel"
 MOONCAKE_TE_WORK_DIR="${CI_RUNNER_WORK_DIR}/builds/mooncake-te"
 HPC_OPS_WORK_DIR="${CI_RUNNER_WORK_DIR}/builds/hpc-ops"
@@ -660,6 +671,7 @@ mkdir -p \
     "${CI_TEST_LOGS_DIR}" \
     "${CI_FINAL_STATE_ROOT}/containers" \
     "${MAIN_CONTAINER_TMP_DIR}" \
+    "${DEEPEP_WORK_DIR}" \
     "${SGL_KERNEL_WORK_DIR}" \
     "${MOONCAKE_TE_WORK_DIR}/compile" \
     "${HPC_OPS_COMPILE_DIR}" \
@@ -674,6 +686,7 @@ echo "[SGLang CI] CI_RUNNER_ID=${CI_RUNNER_ID}"
 echo "[SGLang CI] CI_RUNNER_ROOT=${CI_RUNNER_ROOT}"
 echo "[SGLang CI] CI_LOGS_DIR=${CI_LOGS_DIR}"
 echo "[SGLang CI] MAIN_PIPELINE_LOG=${MAIN_PIPELINE_LOG}"
+echo "[SGLang CI] DEEPEP_BUILD_LOG=${DEEPEP_BUILD_LOG}"
 echo "[SGLang CI] SGL_KERNEL_BUILD_LOG=${SGL_KERNEL_BUILD_LOG}"
 echo "[SGLang CI] MOONCAKE_TE_BUILD_LOG=${MOONCAKE_TE_BUILD_LOG}"
 echo "[SGLang CI] HPC_OPS_BUILD_LOG=${HPC_OPS_BUILD_LOG}"
@@ -815,6 +828,7 @@ run_docker_attached docker run \
 
         mkdir -p \
             '${MAIN_CONTAINER_TMP_DIR}' \
+            '${DEEPEP_WORK_DIR}' \
             '${SGL_KERNEL_WORK_DIR}' \
             '${MOONCAKE_TE_WORK_DIR}' \
             '${HPC_OPS_WORK_DIR}' \
@@ -835,6 +849,35 @@ run_docker_attached docker run \
         chmod +x /sgl-workspace/entrypoint.sh
 
         # ---------- 编译 ----------
+
+        # DeepEP Kimi-K3 patch is a temporary-image-only overlay. Formal
+        # review/merge behavior remains unchanged until a persistent DeepEP
+        # wheel cache is introduced.
+        if [[ '${CI_MODE}' != 'temp-image' ]]; then
+            echo '[JD CI] 非临时镜像模式: 保持基础镜像 DeepEP 不变'
+        elif [[ '${JD_CI_SKIP_DEEPEP_BUILD}' == '1' ]]; then
+            echo '[JD CI] 跳过 DeepEP patch 和编译 (JD_CI_SKIP_DEEPEP_BUILD=1)'
+        else
+            echo '[JD CI] 开始应用 Kimi-K3 DeepEP patch 并重编 wheel'
+            echo '[JD CI] DeepEP arches: ${DEEPEP_TORCH_CUDA_ARCH_LIST}'
+            if [[ ! -f /sgl-workspace/sglang/docker/kimi_k3/apply_deepep_k3_patch.sh ]]; then
+                echo '[JD CI] ERROR: Kimi-K3 DeepEP patch script 不存在' >&2
+                exit 1
+            fi
+            if [[ ! -d /sgl-workspace/DeepEP/csrc ]]; then
+                echo '[JD CI] ERROR: DeepEP 源码不存在: /sgl-workspace/DeepEP' >&2
+                exit 1
+            fi
+            set -o pipefail
+            run_with_isolated_workspace '${DEEPEP_WORK_DIR}' \
+                env \
+                    DEEPEP_DIR='/sgl-workspace/DeepEP' \
+                    TORCH_CUDA_ARCH_LIST='${DEEPEP_TORCH_CUDA_ARCH_LIST}' \
+                    bash '/sgl-workspace/sglang/docker/kimi_k3/apply_deepep_k3_patch.sh' \
+                    2>&1 | tee '${DEEPEP_BUILD_LOG}'
+            set +o pipefail
+            rm -rf /sgl-workspace/DeepEP/build /sgl-workspace/DeepEP/dist
+        fi
 
         if [[ '${JD_CI_SKIP_MOONCAKE_BUILD}' == '1' ]]; then
             echo '[JD CI] 跳过 mooncake 编译 (JD_CI_SKIP_MOONCAKE_BUILD=1)'

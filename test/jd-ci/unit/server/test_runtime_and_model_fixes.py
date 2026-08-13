@@ -1,4 +1,6 @@
+import ast
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -42,6 +44,41 @@ class TestJDRequestAndMultimodalRuntime(unittest.TestCase):
 
 
 class TestJDW4A8Configuration(unittest.TestCase):
+    def test_low_latency_cutlass_dispatch_uses_current_dtype_enum(self):
+        source_path = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/layers/moe/token_dispatcher/deepep.py"
+        )
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        dispatcher_class = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "_DeepEPDispatcherImplLowLatency"
+        )
+        set_dtype = next(
+            node
+            for node in dispatcher_class.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "set_deepep_dispatcher_dtype"
+        )
+
+        loaded_names = {
+            node.id
+            for node in ast.walk(set_dtype)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+        }
+        dispatcher_members = sorted(
+            node.attr
+            for node in ast.walk(set_dtype)
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "DispatcherOutputDtype"
+        )
+
+        self.assertNotIn("DeepEPOutputDtype", loaded_names)
+        self.assertEqual(dispatcher_members, ["BF16", "FP8"])
+
     def test_scale_pack_supports_jd_group_sizes(self):
         self.assertEqual(get_cutlass_w4a8_scale_pack(7168, 32), 4)
         self.assertEqual(get_cutlass_w4a8_scale_pack(7168, 128), 4)
