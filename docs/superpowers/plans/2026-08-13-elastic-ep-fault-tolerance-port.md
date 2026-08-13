@@ -369,8 +369,15 @@ env PYTHONPATH=python pytest -q test/registered/unit/elastic_ep/test_control_pla
 
 Expected: `2 passed`, with no length assertion.
 
-- [ ] **Step 4: Re-run surrounding acceptance checks**
+- [x] **Step 4: Re-run surrounding acceptance checks**
 
 Run the complete Elastic EP control-plane file, the selected surrounding unit
 suite, repository pre-commit hooks, `compileall`, and `git diff --check`. Record
 fresh exit codes in the handoff and review report.
+
+Observed on `bt-6.200.22.140` in `sgl0514-dev-wjl`:
+
+- Complete control-plane file: `43 passed`.
+- Thirteen surrounding parallel-state, Controller/IPC, Tokenizer, ServerArgs,
+  EPLB, and Radix-cache files: `123 passed, 83 subtests passed`.
+- Changed-file pre-commit hooks, `compileall`, and `git diff --check`: exit 0.
