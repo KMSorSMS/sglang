@@ -671,10 +671,10 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         # Low-Latency w4a8 needs fp8 dispatch (per-token scale), not the
         # BF16 forced by the base selection for the cutlass runner.
         if (
-            self.deepep_output_dtype == DeepEPOutputDtype.BF16
+            self.deepep_output_dtype == DispatcherOutputDtype.BF16
             and get_moe_runner_backend().is_cutlass()
         ):
-            self.deepep_output_dtype = DeepEPOutputDtype.FP8
+            self.deepep_output_dtype = DispatcherOutputDtype.FP8
             self.use_fp8 = True
             self.use_nvfp4 = False
 
