@@ -19,8 +19,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from sglang.srt.elastic_ep.elastic_ep import ElasticEPState, ElasticEPStateManager
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.elastic_ep.elastic_ep import ElasticEPState, ElasticEPStateManager
 from sglang.srt.managers.elastic_ep_status import (
     CompositeElasticEPStatusPublisher,
     ControllerElasticEPStatusPublisher,

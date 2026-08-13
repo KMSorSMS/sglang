@@ -66,7 +66,8 @@ class SchedulerElasticEPMixin:
         # in pop_and_process already drained, so this is a no-op there.
         self.forward_stream.synchronize()
         if not elastic_ep_state.commit_active_snapshot(
-            self.tp_group.active_ranks_cpu, self.tp_cpu_group
+            self.tp_group.get_active_ranks_for_elastic_ep(cpu=True),
+            self.tp_cpu_group,
         ):
             return True
         try:
@@ -119,11 +120,11 @@ class SchedulerElasticEPMixin:
         # without a synchronous commit here, metrics could report HEALTHY before
         # tp_group active-rank consensus (all_reduce MIN) has run.
         elastic_ep_state.submit_active_snapshot(
-            self.tp_group.active_ranks_cpu,
+            self.tp_group.get_active_ranks_for_elastic_ep(cpu=True),
             non_blocking=False,
         )
         elastic_ep_state.commit_active_snapshot(
-            self.tp_group.active_ranks_cpu,
+            self.tp_group.get_active_ranks_for_elastic_ep(cpu=True),
             self.tp_cpu_group,
         )
         self._publish_active_ranks_from_committed_snapshot()

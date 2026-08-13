@@ -1433,7 +1433,9 @@ class ModelRunner:
         if self.enable_elastic_ep and not self.is_draft_worker:
             assert elastic_ep_state is not None
             elastic_ep_state.submit_active_snapshot(
-                global_pg_active_ranks=self.tp_group.active_ranks,
+                global_pg_active_ranks=(
+                    self.tp_group.get_active_ranks_for_elastic_ep()
+                ),
                 non_blocking=not get_schedule().disable_overlap_schedule,
             )
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
