@@ -45,10 +45,9 @@ from sglang.srt.elastic_ep.elastic_ep import (
     get_scale_cohort_target,
     join_process_groups,
     join_scale_process_group,
-    maybe_rebalance_after_rank_fault,
-    maybe_recover_ep_ranks,
     register_scale_cohort,
     try_admit_scale_ranks,
+    try_recover_ranks,
 )
 from sglang.srt.elastic_ep.expert_backup_client import ExpertBackupClient
 from sglang.srt.environ import envs
@@ -1391,6 +1390,7 @@ class ModelRunner:
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
         self.forward_pass_id += 1
+        elastic_ep_state = ElasticEPStateManager.instance()
 
         # Try msprob debugger
         if self.msprobe_debugger is not None:
@@ -1430,14 +1430,12 @@ class ModelRunner:
                 reinit_attn_backend,
                 split_forward_count,
             )
-            if self.enable_elastic_ep:
-                output = self._maybe_rebalance_after_rank_fault(
-                    output,
-                    forward_batch,
-                    pp_proxy_tensors,
-                    reinit_attn_backend,
-                    split_forward_count,
-                )
+        if self.enable_elastic_ep and not self.is_draft_worker:
+            assert elastic_ep_state is not None
+            elastic_ep_state.submit_active_snapshot(
+                global_pg_active_ranks=self.tp_group.active_ranks,
+                non_blocking=not get_schedule().disable_overlap_schedule,
+            )
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         no_copy_to_cpu = not get_schedule().disable_overlap_schedule
@@ -1890,14 +1888,9 @@ class ModelRunner:
                     logger.error("[Elastic EP] %s", error)
                 return
 
-            recovered = maybe_recover_ep_ranks(
-                tp_group=self.tp_group,
-                eplb_manager=self.eplb_manager,
-                model_config=self.model_config,
-                moe_ep_rank=self._elastic_global_rank(),
-            )
-            if recovered:
-                self.forward_pass_id = 0
+            # Ordinary rank recovery is coordinated by the scheduler admission
+            # gate. Running it here would let ranks enter collectives from
+            # different forward generations.
             return
 
         local_timeout = (
@@ -1947,22 +1940,25 @@ class ModelRunner:
                 effective_size=effective_size,
             )
 
-    def _maybe_rebalance_after_rank_fault(
-        self,
-        output: ModelRunnerOutput,
-        forward_batch: ForwardBatch,
-        pp_proxy_tensors: Optional[PPProxyTensors],
-        reinit_attn_backend: bool,
-        split_forward_count: int,
-    ) -> ModelRunnerOutput:
-        if maybe_rebalance_after_rank_fault(eplb_manager=self.eplb_manager):
-            output = self._forward_raw(
-                forward_batch,
-                pp_proxy_tensors,
-                reinit_attn_backend,
-                split_forward_count,
+    def recover_ep_ranks_after_retract(self, ranks_to_recover: list[int]) -> None:
+        assert ranks_to_recover
+        if not try_recover_ranks(ranks_to_recover):
+            raise RuntimeError(
+                f"Elastic EP peers became unavailable during recovery: "
+                f"{ranks_to_recover}"
             )
-        return output
+
+        self.forward_pass_id = 0
+        if self.eplb_manager is not None:
+            self.eplb_manager.reset_generator()
+        broadcast_global_expert_location_metadata(
+            model_config=self.model_config,
+            moe_ep_rank=self._elastic_global_rank(),
+            src_rank=get_healthy_expert_location_src_rank(
+                invoked_in_elastic_ep_rejoin_path=False
+            ),
+        )
+        ElasticEPStateManager.instance().reset()
 
     def update_model_fields(
         self,

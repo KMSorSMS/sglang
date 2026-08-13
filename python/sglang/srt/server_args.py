@@ -2336,6 +2336,11 @@ class ServerArgs:
         "trivial"
     )
     enable_eplb: A[bool, "Enable EPLB algorithm", NS("exec.moe")] = False
+    eplb_rebalance_on_fault_only: A[
+        bool,
+        "Skip periodic EPLB and rebalance only after an Elastic EP fault.",
+        NS("exec.moe"),
+    ] = False
     eplb_algorithm: A[str, "Chosen EPLB algorithm", NS("exec.moe")] = "auto"
     eplb_rebalance_num_iterations: A[
         int,
@@ -6808,10 +6813,20 @@ class ServerArgs:
         return required
 
     def _handle_eplb_and_dispatch(self):
-        if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
+        if (
+            self.enable_eplb
+            and not self.eplb_rebalance_on_fault_only
+            and self.expert_distribution_recorder_mode is None
+        ):
             self.expert_distribution_recorder_mode = "stat"
             logger.warning(
                 "EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
+            )
+
+        if self.eplb_rebalance_on_fault_only:
+            assert self.enable_eplb and self.elastic_ep_backend is not None, (
+                "--eplb-rebalance-on-fault-only requires --enable-eplb and "
+                "an --elastic-ep-backend."
             )
 
         # Without an a2a backend all EP ranks run the MoE over the same tokens and
@@ -9398,6 +9413,8 @@ class PortArgs:
     tokenizer_ipc_name: str
     # The ipc filename for scheduler (rank 0) to receive inputs from tokenizer (zmq)
     scheduler_input_ipc_name: str
+    # The endpoint for scheduler Elastic EP updates to DataParallelController.
+    controller_input_ipc_name: str
     # The ipc filename for detokenizer to receive inputs from scheduler (zmq)
     detokenizer_ipc_name: str
 
@@ -9467,6 +9484,7 @@ class PortArgs:
             return PortArgs(
                 tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                controller_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 detokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 nccl_port=nccl_port,
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
@@ -9493,7 +9511,7 @@ class PortArgs:
             # every init_new call agrees, decrementing below dist_init_port on
             # overflow.
             is_rust_server = envs.SGLANG_RUST_SERVER.get()
-            NUM_DERIVED_PORTS = 6 if not is_rust_server else 6 + server_args.dp_size
+            NUM_DERIVED_PORTS = 7 if not is_rust_server else 7 + server_args.dp_size
             if server_args.is_ep_scale_joiner:
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
                 if port_base + NUM_DERIVED_PORTS > 65535:
@@ -9507,13 +9525,14 @@ class PortArgs:
             rpc_port = port_base + 2
             metrics_port = port_base + 3
             load_collector_port = port_base + 5
+            controller_input_port = port_base + 6
             if dp_rank is None:
                 # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
             elif is_rust_server:
                 # Rust server path (SGLANG_RUST_SERVER + dp attention): there is no
                 # DataParallelController allocating worker ports.
-                scheduler_input_port = port_base + 6 + dp_rank
+                scheduler_input_port = port_base + 7 + dp_rank
             else:
                 assert worker_ports is not None
                 scheduler_input_port = worker_ports[dp_rank]
@@ -9538,6 +9557,7 @@ class PortArgs:
                     wait_port_available(metrics_port, "metrics_port")
                     if server_args.nnodes > 1:
                         wait_port_available(load_collector_port, "load_collector_port")
+                    wait_port_available(controller_input_port, "controller_input_port")
                 # Check scheduler_input_port only for dp.
                 # Skip check when using worker_ports since the port is already bound by our ZMQ socket
                 if dp_rank is None or worker_ports is None:
@@ -9552,6 +9572,9 @@ class PortArgs:
                 tokenizer_ipc_name=NetworkAddress(dist_init_host, port_base).to_tcp(),
                 scheduler_input_ipc_name=NetworkAddress(
                     dist_init_host, scheduler_input_port
+                ).to_tcp(),
+                controller_input_ipc_name=NetworkAddress(
+                    dist_init_host, controller_input_port
                 ).to_tcp(),
                 detokenizer_ipc_name=NetworkAddress(
                     dist_init_host, detokenizer_port

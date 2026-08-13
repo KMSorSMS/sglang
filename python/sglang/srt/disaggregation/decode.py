@@ -2130,7 +2130,14 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Launch the current batch
             if batch:
+                if (
+                    self.server_args.elastic_ep_backend is not None
+                    and not self._admit_elastic_ep_forward(batch)
+                ):
+                    continue
                 result = self.run_batch(batch)
+                if self.server_args.elastic_ep_backend is not None:
+                    self._drain_elastic_ep_snapshot_copy(result)
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states
@@ -2146,6 +2153,8 @@ class SchedulerDisaggregationDecodeMixin:
 
         def pop_and_process():
             tmp_batch, tmp_result = self.result_queue.popleft()
+            if self.server_args.elastic_ep_backend is not None:
+                self._drain_elastic_ep_snapshot_copy(tmp_result)
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
@@ -2176,6 +2185,11 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Launch the current batch
             if batch:
+                if (
+                    self.server_args.elastic_ep_backend is not None
+                    and not self._admit_elastic_ep_forward(batch)
+                ):
+                    continue
                 batch_result = self.run_batch(batch)
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))

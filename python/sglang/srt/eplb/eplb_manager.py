@@ -13,6 +13,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
+    ModelConfigForExpertLocation,
     format_expert_location_layout,
     format_expert_location_layout_diff,
     get_global_expert_location_metadata,
@@ -54,25 +55,33 @@ class EPLBManager:
             self._server_args.eplb_rebalance_layers_per_chunk
         )
         self._rebalance_num_iterations = self._server_args.eplb_rebalance_num_iterations
+        self._rebalance_on_fault_only = self._server_args.eplb_rebalance_on_fault_only
         self._rebalance_disabled_reason = None
         self._rebalance_disabled_logged = False
 
         # Otherwise, the circular buffer will contain stale data. If the case is needed, it can be implemented.
-        assert (
-            self._server_args.eplb_rebalance_num_iterations
-            >= self._server_args.expert_distribution_recorder_buffer_size
-        ), "eplb_rebalance_num_iterations must be greater than expert_distribution_recorder_buffer_size"
+        if not self._rebalance_on_fault_only:
+            assert (
+                self._server_args.eplb_rebalance_num_iterations
+                >= self._server_args.expert_distribution_recorder_buffer_size
+            ), "eplb_rebalance_num_iterations must be greater than expert_distribution_recorder_buffer_size"
 
-        if not get_global_expert_distribution_recorder().recording:
-            get_global_expert_distribution_recorder().start_record()
+            if not get_global_expert_distribution_recorder().recording:
+                get_global_expert_distribution_recorder().start_record()
 
-        logger.info(
-            f"[EPLBManager] system started, will rebalance per {self._rebalance_num_iterations} iterations."
-        )
+        if self._rebalance_on_fault_only:
+            logger.info("[EPLBManager] system started in fault-only mode.")
+        else:
+            logger.info(
+                "[EPLBManager] system started, will rebalance per %s iterations.",
+                self._rebalance_num_iterations,
+            )
 
         self._main_generator = self._entrypoint()
 
     def on_forward_pass_end(self):
+        if self._rebalance_on_fault_only:
+            return
         next(self._main_generator)
 
     def reset_generator(self):
@@ -123,17 +132,26 @@ class EPLBManager:
             torch.get_device_module().synchronize()
             time_start = time.time()
 
-        dump_record_output = get_global_expert_distribution_recorder().dump_record(
-            output_mode="object"
-        )
-        logical_count = dump_record_output["logical_count"]
-        average_utilization_rate_over_window = dump_record_output[
-            "average_utilization_rate_over_window"
-        ]
+        if self._rebalance_on_fault_only:
+            model_config = ModelConfigForExpertLocation.from_model_config(
+                self._model_config
+            )
+            assert model_config is not None
+            logical_count = torch.ones(
+                (model_config.num_layers, model_config.num_logical_experts),
+                dtype=torch.int32,
+            )
+        else:
+            dump_record_output = get_global_expert_distribution_recorder().dump_record(
+                output_mode="object"
+            )
+            logical_count = dump_record_output["logical_count"]
+            average_utilization_rate_over_window = dump_record_output[
+                "average_utilization_rate_over_window"
+            ]
 
-        # Check whether rebalancing is needed
-        if not self._check_rebalance_needed(average_utilization_rate_over_window):
-            return
+            if not self._check_rebalance_needed(average_utilization_rate_over_window):
+                return
 
         expert_location_metadata = self._compute_expert_location_metadata(
             logical_count,

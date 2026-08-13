@@ -13,9 +13,10 @@ is exercised as the real method, no mock.
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import msgspec.structs
+import zmq
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -207,6 +208,23 @@ class TestRoundRobinScheduler(CustomTestCase):
         # Subsequent round-robin req still lands on worker 0
         ctl.round_robin_scheduler(_req())
         ctl.workers[0].send_pyobj.assert_called_once()
+
+    def test_timeout_marks_worker_unavailable_and_tries_next(self):
+        ctl = _make_controller(dp_size=3)
+        ctl.server_args = SimpleNamespace(elastic_ep_backend="mooncake")
+        ctl.elastic_ep_send_timeout_ms = 10
+        request = _req()
+
+        with patch(
+            "sglang.srt.managers.data_parallel_controller.sock_send",
+            side_effect=[zmq.Again(), None],
+        ) as send:
+            ctl.round_robin_scheduler(request)
+
+        self.assertFalse(ctl.status[0])
+        self.assertEqual(send.call_args_list[0].args, (ctl.workers[0], request))
+        self.assertEqual(send.call_args_list[1].args, (ctl.workers[1], request))
+        self.assertEqual(ctl.round_robin_counter, 2)
 
 
 class TestFollowBootstrapRoomScheduler(CustomTestCase):
