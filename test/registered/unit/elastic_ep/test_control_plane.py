@@ -12,12 +12,15 @@ The fix has exactly three moving parts:
 
 from __future__ import annotations
 
+import sys
+from types import ModuleType
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPState, ElasticEPStateManager
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.managers.elastic_ep_status import (
     CompositeElasticEPStatusPublisher,
     ControllerElasticEPStatusPublisher,
@@ -81,6 +84,85 @@ class TestScheduler(SchedulerElasticEPMixin):
         self.result_queue = deque()
         self.last_batch = None
         self.cur_batch_for_debug = None
+
+
+class TestCapacitySizedActiveRanks:
+    def test_mooncake_group_preserves_capacity_mask_for_elastic_ep(self):
+        class FakeMooncakeBackendOptions:
+            def __init__(self, active_ranks, recovered_rank, max_world_size=None):
+                self.active_ranks = active_ranks
+                self.recovered_rank = recovered_rank
+                self.max_world_size = max_world_size
+
+        mooncake_module = ModuleType("mooncake")
+        mooncake_pg_module = ModuleType("mooncake.pg")
+        mooncake_pg_module.MooncakeBackendOptions = FakeMooncakeBackendOptions
+        mooncake_module.pg = mooncake_pg_module
+
+        with patch.dict(
+            sys.modules,
+            {"mooncake": mooncake_module, "mooncake.pg": mooncake_pg_module},
+        ), patch(
+            "sglang.srt.distributed.parallel_state.is_cuda_alike",
+            return_value=False,
+        ), patch.object(
+            torch.distributed, "get_rank", return_value=0
+        ), patch.object(
+            torch.distributed, "new_group", side_effect=[MagicMock(), MagicMock()]
+        ):
+            group = GroupCoordinator(
+                group_ranks=[[0, 1, 2, 3]],
+                local_rank=0,
+                torch_distributed_backend="mooncake",
+                use_pynccl=False,
+                use_pymscclpp=False,
+                use_custom_allreduce=False,
+                use_torch_symm_mem_all_reduce=False,
+                use_hpu_communicator=False,
+                use_xpu_communicator=False,
+                use_npu_communicator=False,
+                max_world_size=8,
+            )
+
+        assert group.active_ranks.tolist() == [1, 1, 1, 1]
+        assert group.active_ranks_cpu.tolist() == [1, 1, 1, 1]
+        assert group.get_active_ranks_for_elastic_ep().tolist() == [
+            1,
+            1,
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+        ]
+        assert group.get_active_ranks_for_elastic_ep(cpu=True).tolist() == [
+            1,
+            1,
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+        ]
+
+    def test_ready_and_admission_use_capacity_sized_group_mask(self):
+        state = _make_state(world=8)
+        state.effective_ep_size = 4
+        state.reset()
+        sched = TestScheduler(world=4)
+        capacity_mask = torch.tensor([1, 1, 1, 1, 0, 0, 0, 0])
+        sched.tp_group.get_active_ranks_for_elastic_ep.return_value = capacity_mask
+
+        with patch.object(ElasticEPStateManager, "instance", return_value=state), patch(
+            "torch.distributed.all_reduce"
+        ):
+            sched._publish_elastic_ep_status_on_ready()
+            state.submit_active_snapshot(capacity_mask, non_blocking=False)
+            assert sched._admit_elastic_ep_forward(MagicMock()) is True
+
+        assert state.committed_active_ranks_cpu.tolist() == capacity_mask.tolist()
 
 
 # ---------------------------------------------------------------------------
