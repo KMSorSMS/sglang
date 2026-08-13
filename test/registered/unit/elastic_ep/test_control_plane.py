@@ -13,14 +13,16 @@ The fix has exactly three moving parts:
 from __future__ import annotations
 
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+import zmq
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPState, ElasticEPStateManager
+from sglang.srt.managers import data_parallel_controller
 from sglang.srt.managers.elastic_ep_status import (
     CompositeElasticEPStatusPublisher,
     ControllerElasticEPStatusPublisher,
@@ -28,6 +30,9 @@ from sglang.srt.managers.elastic_ep_status import (
     MetricsElasticEPStatusPublisher,
     _compute_cluster_state,
     _effective_committed_active_ranks,
+)
+from sglang.srt.managers.scheduler_components.ipc_channels import (
+    SchedulerIpcChannels,
 )
 from sglang.srt.managers.scheduler_elastic_ep_mixin import SchedulerElasticEPMixin
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -963,6 +968,68 @@ class TestElasticEPStatusPublisher:
 
         healthy.publish_committed_active_ranks.assert_called_once_with(
             mask, adjusting=True
+        )
+
+
+class TestElasticEPStatusSocketOptions(CustomTestCase):
+    def test_scheduler_status_sender_uses_latest_value_zero_wait_options(self):
+        socket = MagicMock()
+        port_args = SimpleNamespace(
+            scheduler_input_ipc_name="ipc://scheduler-input",
+            rpc_ipc_name="ipc://rpc",
+            tokenizer_ipc_name="ipc://tokenizer",
+            controller_input_ipc_name="ipc://controller-status",
+            detokenizer_ipc_name="ipc://detokenizer",
+            metrics_ipc_name="ipc://metrics",
+        )
+        with patch(
+            "sglang.srt.managers.scheduler_components.ipc_channels.get_zmq_socket",
+            return_value=socket,
+        ) as get_socket, patch(
+            "sglang.srt.managers.scheduler_components.ipc_channels.zmq.Context"
+        ):
+            SchedulerIpcChannels.create(
+                port_args=port_args,
+                is_rank_zero=True,
+                skip_tokenizer_init=False,
+                metrics_enabled=False,
+                enable_scripted_runtime=False,
+            )
+
+        controller_call = next(
+            call
+            for call in get_socket.call_args_list
+            if call.args[2] == port_args.controller_input_ipc_name
+        )
+        assert controller_call.kwargs["socket_options"] == {
+            zmq.CONFLATE: 1,
+            zmq.SNDTIMEO: 0,
+            zmq.LINGER: 0,
+        }
+
+    def test_dpc_status_receiver_conflates_to_latest_value(self):
+        create_receiver = getattr(
+            data_parallel_controller,
+            "_create_scheduler_status_receiver",
+            None,
+        )
+        assert create_receiver is not None
+
+        context = MagicMock()
+        socket = MagicMock()
+        with patch(
+            "sglang.srt.managers.data_parallel_controller.get_zmq_socket",
+            return_value=socket,
+        ) as get_socket:
+            result = create_receiver(context, "ipc://controller-status")
+
+        assert result is socket
+        get_socket.assert_called_once_with(
+            context,
+            zmq.PULL,
+            "ipc://controller-status",
+            True,
+            socket_options={zmq.CONFLATE: 1},
         )
 
 
