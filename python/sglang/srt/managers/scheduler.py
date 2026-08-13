@@ -1870,7 +1870,9 @@ class Scheduler(
         )
 
         if self.require_mlp_sync:
-            grammar_serial = torch.tensor([int(need_grammar_sync)], dtype=torch.int32)
+            grammar_serial = torch.tensor(
+                [1 if need_grammar_sync else 0], dtype=torch.int32
+            )
             torch.distributed.all_reduce(
                 grammar_serial,
                 op=torch.distributed.ReduceOp.MAX,
