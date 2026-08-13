@@ -12,6 +12,7 @@ The fix has exactly three moving parts:
 
 from __future__ import annotations
 
+import os
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -22,6 +23,10 @@ import zmq
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPState, ElasticEPStateManager
+from sglang.srt.environ import envs
+from sglang.srt.layers.moe.token_dispatcher.mooncake import (
+    _MooncakeEPDispatcherImpl,
+)
 from sglang.srt.managers import data_parallel_controller
 from sglang.srt.managers.elastic_ep_status import (
     CompositeElasticEPStatusPublisher,
@@ -438,6 +443,121 @@ class TestCommitSemantics:
         state.resync_active_to_committed()
         assert state.ep_suspect_consensus_cpu[2].item() == 1
         assert state.has_ep_suspects() is False
+
+
+class TestMooncakeAndProcessGroupAuthority(CustomTestCase):
+    def test_a2a_timeout_only_marks_suspect(self):
+        state = _make_state(world=4)
+        state.active_ranks[2] = 0
+        pg_health = torch.ones(4, dtype=torch.int32)
+        state.submit_active_snapshot(pg_health, non_blocking=False)
+
+        with patch("torch.distributed.all_reduce"):
+            assert state.commit_active_snapshot(pg_health, MagicMock()) is True
+
+        assert state.committed_active_ranks_cpu.tolist() == [1, 1, 1, 1]
+        assert state.ep_suspect_ranks() == [2]
+
+    def test_pg_probe_is_death_authority(self):
+        state = _make_state(world=4)
+        pg_health = torch.tensor([1, 1, 0, 1], dtype=torch.int32)
+        state.submit_active_snapshot(pg_health, non_blocking=False)
+
+        with patch("torch.distributed.all_reduce"):
+            assert state.commit_active_snapshot(pg_health, MagicMock()) is True
+
+        assert state.committed_active_ranks_cpu.tolist() == [1, 1, 0, 1]
+        assert state.ep_suspect_ranks() == []
+
+    def test_mooncake_fault_timeout_matches_pinned_snapshot(self):
+        mooncake_module = ModuleType("mooncake")
+        mooncake_module.__path__ = []
+        buffer_module = ModuleType("mooncake.mooncake_ep_buffer")
+        buffer_module.Buffer = object
+        buffer = MagicMock()
+        buffer.dispatch.return_value = (
+            torch.empty(0),
+            torch.empty(0),
+            None,
+            MagicMock(),
+            MagicMock(),
+        )
+        state = _make_state(world=4)
+
+        with patch.dict(
+            sys.modules,
+            {
+                "mooncake": mooncake_module,
+                "mooncake.mooncake_ep_buffer": buffer_module,
+            },
+        ), patch.dict(os.environ, {}, clear=False), patch.object(
+            ElasticEPStateManager, "instance", return_value=state
+        ):
+            os.environ.pop("SGLANG_MOONCAKE_EP_TIMEOUT_US", None)
+            dispatcher = _MooncakeEPDispatcherImpl(
+                group=MagicMock(),
+                router_topk=2,
+                permute_fusion=False,
+                num_experts=4,
+                num_local_experts=1,
+                hidden_size=8,
+                params_dtype=torch.float16,
+                return_recv_hook=False,
+                deepep_mode=MagicMock(),
+            )
+            dispatcher._get_buffer = MagicMock(return_value=buffer)
+            hidden = torch.zeros((1, 8))
+            topk_ids = torch.zeros((1, 2), dtype=torch.int64)
+
+            dispatcher._dispatch_core(hidden, topk_ids)
+            assert buffer.dispatch.call_args.args[5] == -1
+
+            dispatcher.first_execution = False
+            dispatcher._dispatch_core(hidden, topk_ids)
+
+        assert dispatcher.timeout_us == 50_000_000
+        assert buffer.dispatch.call_args.args[5] == 50_000_000
+
+
+class TestRetractCacheAndExpertState(CustomTestCase):
+    def test_retract_clears_cache_and_updates_expert_state(self):
+        state = _make_state(world=4)
+        state.committed_active_ranks_cpu[2] = 0
+        state.submit_active_snapshot(
+            torch.ones(4, dtype=torch.int32), non_blocking=False
+        )
+        sched = TestScheduler(world=4)
+        req = MagicMock(retraction_count=0)
+        batch = MagicMock()
+        batch.reqs = [req]
+        sched.running_batch = batch
+        sched.cur_batch_for_debug = batch
+        sched.chunked_req = MagicMock()
+        sched.ipc_channels = MagicMock()
+        sched._add_request_to_queue = MagicMock()
+        eplb_manager = MagicMock()
+        eplb_manager.rebalance.return_value = iter([None])
+        sched.tp_worker = MagicMock()
+        sched.tp_worker.model_runner.eplb_manager = eplb_manager
+
+        with patch.object(
+            ElasticEPStateManager, "instance", return_value=state
+        ), patch("torch.cuda.synchronize"), patch.object(
+            envs.SGLANG_ELASTIC_EP_MAX_RETRACTION, "get", return_value=3
+        ):
+            sched._retract_all_and_rebalance_on_rank_fault()
+
+        batch.release_req.assert_called_once_with(0, 0, sched.server_args)
+        assert state.pending_staging_slots == []
+        eplb_manager.rebalance.assert_called_once()
+        assert (
+            state.active_ranks.tolist()
+            == state.committed_active_ranks_cpu.tolist()
+        )
+        assert (
+            state.last_handled_committed_active_ranks_cpu.tolist()
+            == state.committed_active_ranks_cpu.tolist()
+        )
 
 
 # ---------------------------------------------------------------------------
