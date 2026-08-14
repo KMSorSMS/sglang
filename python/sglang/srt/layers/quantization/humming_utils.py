@@ -50,7 +50,17 @@ def _set_humming_dispatcher_output_dtype(
 
 
 def configure_humming_deepep_dispatch(layer: torch.nn.Module) -> bool:
-    if not get_moe_a2a_backend().is_deepep():
+    a2a_backend = get_moe_a2a_backend()
+    if a2a_backend.is_mooncake():
+        # Mooncake EP dispatch always emits FP8 hidden states plus FP32
+        # group-128 scales in the DeepEP low-latency layout (use_fp8=True is
+        # fixed in MooncakeDeepEPDispatcher.dispatch_a), so Humming must be
+        # configured for FP8 dispatch. The mooncake dispatcher has no
+        # set_quant_config, so unlike DeepEP there is nothing to negotiate.
+        layer._humming_uses_deepep_fp8_dispatch = True
+        return True
+
+    if not a2a_backend.is_deepep():
         layer._humming_uses_deepep_fp8_dispatch = False
         _set_humming_dispatcher_output_dtype(layer, "bf16")
         return False

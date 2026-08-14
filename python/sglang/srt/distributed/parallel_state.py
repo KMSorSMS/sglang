@@ -319,10 +319,11 @@ class GroupCoordinator:
 
                 pg_active_size = len(ranks)
                 if not recovered_rank and max_world_size is not None:
-                    assert max_world_size >= len(ranks), (
-                        f"max_world_size ({max_world_size}) must be >= "
-                        f"group size ({len(ranks)})"
-                    )
+                    if max_world_size < len(ranks):
+                        raise ValueError(
+                            f"max_world_size ({max_world_size}) must be >= "
+                            f"group size ({len(ranks)})"
+                        )
                     pg_active_size = max_world_size
 
                 pg_active_ranks = torch.zeros(

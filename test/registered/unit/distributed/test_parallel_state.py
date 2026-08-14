@@ -37,9 +37,11 @@ not the per-rank group membership logic.
 from __future__ import annotations
 
 import sys
+import types
 from unittest.mock import Mock, patch
 
 import pytest
+import torch
 
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -266,6 +268,104 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
 
             # Cleanup
             parallel_state.destroy_model_parallel()
+
+
+class TestGroupLocalActiveRanks:
+    @staticmethod
+    def _construct_mooncake_group(ranks, max_world_size=None):
+        class FakeMooncakeBackendOptions:
+            instances = []
+
+            def __init__(self, active_ranks, recovered_rank, max_world_size=None):
+                self.active_ranks = active_ranks
+                self.recovered_rank = recovered_rank
+                self.max_world_size = max_world_size
+                self.__class__.instances.append(self)
+
+        mooncake_module = types.ModuleType("mooncake")
+        mooncake_pg_module = types.ModuleType("mooncake.pg")
+        mooncake_pg_module.MooncakeBackendOptions = FakeMooncakeBackendOptions
+        mooncake_module.pg = mooncake_pg_module
+
+        with (
+            patch.dict(
+                sys.modules,
+                {"mooncake": mooncake_module, "mooncake.pg": mooncake_pg_module},
+            ),
+            patch.object(parallel_state, "is_cuda_alike", return_value=False),
+            patch("torch.distributed.get_rank", return_value=ranks[0]),
+            patch("torch.distributed.new_group", return_value=Mock()) as new_group,
+        ):
+            group = parallel_state.GroupCoordinator(
+                group_ranks=[ranks],
+                local_rank=0,
+                torch_distributed_backend="mooncake",
+                use_pynccl=False,
+                use_pymscclpp=False,
+                use_custom_allreduce=False,
+                use_torch_symm_mem_all_reduce=False,
+                use_hpu_communicator=False,
+                use_xpu_communicator=False,
+                use_npu_communicator=False,
+                max_world_size=max_world_size,
+            )
+
+        assert new_group.call_count == 2
+        return group, FakeMooncakeBackendOptions.instances
+
+    def test_nonzero_contiguous_ranks_use_group_local_mirrors(self):
+        ranks = [32, 33, 34, 35]
+
+        try:
+            group, options = self._construct_mooncake_group(ranks, max_world_size=8)
+        except ValueError as error:
+            pytest.fail(
+                "Mooncake capacity must be measured in group-local slots, not "
+                f"global ranks: {error}"
+            )
+
+        assert len(options) == 2
+        assert [option.active_ranks.tolist() for option in options] == [
+            [1, 1, 1, 1, 0, 0, 0, 0],
+            [1, 1, 1, 1, 0, 0, 0, 0],
+        ]
+        assert [option.recovered_rank for option in options] == [False, False]
+        assert [option.max_world_size for option in options] == [8, 8]
+        assert group.active_ranks.tolist() == [1, 1, 1, 1]
+        assert group.active_ranks_cpu.tolist() == [1, 1, 1, 1]
+
+        options[0].active_ranks[2] = 0
+        assert group.active_ranks.tolist() == [1, 1, 0, 1]
+        assert group.active_ranks_cpu.tolist() == [1, 1, 1, 1]
+
+        options[1].active_ranks[2] = 0
+        assert group.active_ranks.tolist() == [1, 1, 0, 1]
+        assert group.active_ranks_cpu.tolist() == [1, 1, 0, 1]
+
+    def test_strided_ranks_use_group_local_mirrors_without_capacity_extension(self):
+        group, options = self._construct_mooncake_group([1, 5, 9])
+
+        assert len(options) == 2
+        assert [option.active_ranks.tolist() for option in options] == [
+            [1, 1, 1],
+            [1, 1, 1],
+        ]
+        assert [option.recovered_rank for option in options] == [False, False]
+        assert [option.max_world_size for option in options] == [None, None]
+        assert group.active_ranks.tolist() == [1, 1, 1]
+        assert group.active_ranks_cpu.tolist() == [1, 1, 1]
+
+        options[0].active_ranks[1] = 0
+        assert group.active_ranks.tolist() == [1, 0, 1]
+        assert group.active_ranks_cpu.tolist() == [1, 1, 1]
+
+        options[1].active_ranks[1] = 0
+        assert group.active_ranks.tolist() == [1, 0, 1]
+        assert group.active_ranks_cpu.tolist() == [1, 0, 1]
+
+    def test_max_world_size_smaller_than_group_is_rejected(self):
+        with pytest.raises(ValueError, match="group size"):
+            self._construct_mooncake_group([32, 33, 34, 35], max_world_size=3)
 
 
 if __name__ == "__main__":
